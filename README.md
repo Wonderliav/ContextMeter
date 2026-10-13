@@ -17,7 +17,7 @@ git clone https://github.com/Wonderliav/ContextMeter.git ~/Documents/Claude/Cont
 cd ~/Documents/Claude/ContextMeter && ./build.sh
 ```
 1. First run asks for Keychain access to "Claude Code-credentials". Choose **Always Allow**. The app reads it through `/usr/bin/security`, read-only, and never logs it. It is only used to get account usage.
-2. Optional: System Settings → Privacy & Security → **Accessibility** → add ContextMeter. With this, Replace presses Return in the new chat itself. Without it, the new chat opens prefilled and you press Return.
+2. On first launch the pill asks once for **Accessibility** (macOS prompt + the settings page opens) — switch ContextMeter on. With this, Replace presses Return in the new chat itself. Without it, the new chat opens prefilled and you press Return.
 3. System Settings → General → **Login Items** → add `ContextMeter.app`.
 4. Optional: set the default permission mode to Auto in Settings → Claude Code, so new chats don't ask to switch modes.
 5. Optional: copy `config.example.json` to `config.json` and change the thresholds. The defaults are used when the file is missing.

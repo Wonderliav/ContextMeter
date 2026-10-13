@@ -653,8 +653,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rescueScreens = rescue
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in rescue() }
         panel.contentView!.addSubview(view); panel.orderFrontRegardless(); rescueScreens?()
-        let trusted = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary)
+        // First launch on a Mac: ask once for Accessibility (lets Replace press Return in the new chat). macOS shows its own
+        // prompt and adds ContextMeter to the list; we also open that settings page. Never asked again after that.
+        let askedKey = "askedAccessibility"
+        let askNow = !UserDefaults.standard.bool(forKey: askedKey)
+        let trusted = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: askNow && !AXIsProcessTrusted()] as CFDictionary)
         log("accessibility trusted = \(trusted)")
+        if askNow { UserDefaults.standard.set(true, forKey: askedKey)
+            if !trusted, let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(u) } }
         if let st = ProcessInfo.processInfo.environment["CM_STATE"] { view.mode = st == "asking" ? .asking : st == "done" ? .done : st == "working" ? .working : .expanded; view.message = "Writing handoff…"; view.frozen = true }
         if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = .expanded; view.frozen = true }
         if let h = ProcessInfo.processInfo.environment["CM_HOVER"], let n = Int(h) { view.mode = .expanded; view.pinned = n; view.frozen = true }
