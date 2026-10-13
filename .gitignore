@@ -1,0 +1,6 @@
+ContextMeter.app/
+config.json
+signing-id
+debug.log
+usage-cache.json
+.DS_Store
