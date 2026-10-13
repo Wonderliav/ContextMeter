@@ -538,16 +538,42 @@ final class MeterView: NSView {
 
     /// Opens a new chat in the Claude app via its claude://code/new link (right folder, handoff pre-filled),
     /// then presses Return. Pressing a key needs Accessibility; without it the chat is left ready to send.
+    /// The Claude app's focused element: (role, start of its text). Needs Accessibility.
+    static func claudeFocus() -> (pid: pid_t, role: String, value: String)? {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first else { return nil }
+        let ax = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetAttributeValue(ax, "AXManualAccessibility" as CFString, kCFBooleanTrue)   // Electron: expose the web content tree
+        var f: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(ax, kAXFocusedUIElementAttribute as CFString, &f)
+        guard err == .success, let el = f else { return (app.processIdentifier, "", "") }
+        var r: CFTypeRef?, v: CFTypeRef?
+        AXUIElementCopyAttributeValue(el as! AXUIElement, kAXRoleAttribute as CFString, &r)
+        AXUIElementCopyAttributeValue(el as! AXUIElement, kAXValueAttribute as CFString, &v)
+        return (app.processIdentifier, (r as? String) ?? "", String(((v as? String) ?? "").prefix(80)))
+    }
+
     static func sendToNewChat(text: String, cwd: String) -> SendResult {
         var allowed = CharacterSet.urlQueryAllowed; allowed.remove(charactersIn: "&=+#?")
         guard text.count < 13_000, let q = text.addingPercentEncoding(withAllowedCharacters: allowed),
               let f = cwd.addingPercentEncoding(withAllowedCharacters: allowed),
               let url = URL(string: "claude://code/new?q=\(q)&folder=\(f)") else { log("link: handoff too long or bad url"); return .failed }
         DispatchQueue.main.sync { NSWorkspace.shared.open(url) }
-        Thread.sleep(forTimeInterval: 3.0)               // let the app open the chat and fill the composer
         guard AXIsProcessTrusted() else { log("link opened; Accessibility not trusted, left for manual Return"); return .prefilled }
-        for down in [true, false] { CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: down)?.post(tap: .cghidEventTap); usleep(40_000) }
-        return .sent
+        // Press Return only when Claude's message box has focus and holds the handoff, never on a dialog or another app.
+        let start = Date(), marker = String(text.prefix(24))
+        var presses = 0
+        while Date().timeIntervalSince(start) < 20 && presses < 3 {
+            usleep(400_000)
+            let ff = claudeFocus()
+            let filled = ff?.role == "AXTextArea" && (ff?.value ?? "").hasPrefix(marker)
+            if presses > 0 && !filled { log("return: sent after \(presses) press(es)"); return .sent }   // box emptied or chat moved on = message went out
+            guard let f = ff, f.role == "AXTextArea" else { continue }
+            guard filled || (f.value.isEmpty && Date().timeIntervalSince(start) > 4 && presses == 0) else { continue }
+            for down in [true, false] { CGEvent(keyboardEventSource: nil, virtualKey: 36, keyDown: down)?.post(tap: .cghidEventTap); usleep(40_000) }
+            presses += 1; usleep(1_200_000)
+        }
+        log(presses > 0 ? "return: pressed \(presses)x, box state unclear" : "return: message box never ready, left for manual Return")
+        return presses > 0 ? .sent : .prefilled
     }
 
     func copyHandoff() { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(handoffText, forType: .string) }
