@@ -32,7 +32,7 @@ To publish a change: edit, run `./build.sh`, test, then `git commit` and `git pu
 | File | What |
 |---|---|
 | `ContextMeter.swift` | Whole app, a single AppKit file |
-| `config.example.json` | Template for `config.json` |
+| `config.example.json` | Template for `config.json`: thresholds, archive group, snooze, `windowOverride`, `pinFiles` |
 | `build.sh` | Compiles, signs (`signing-id` or ad-hoc), relaunches |
 | `Info.plist` | Bundle info (LSUIElement, so no Dock icon) |
 | `config.json` | `askAtPercent`, `redAtPercent`, `archiveGroup`, `snoozeMinutes`, `windowOverride` (force a context size) |
@@ -45,7 +45,7 @@ To publish a change: edit, run `./build.sh`, test, then `git commit` and `git pu
 - **Account usage:** `GET https://api.anthropic.com/api/oauth/usage` with the Claude Code OAuth token from the Keychain.
 - **Handoff:** `claude -p … --resume <cli id> --fork-session` writes the note. It opens via `claude://code/new?q=…&folder=…`, and that link only accepts q, folder and file. Notes are saved in `~/Documents/Claude/handoffs/`.
 - **Model/effort carry-over:** a chat can't change its own model or effort. The new chat asks the old chat, via send_message, to call set_session_model and set_session_effort on it. The change applies from the new chat's second turn.
-- **Optional, owner-specific:** retargets `~/MotionMachine/apps/MotionChat/config.json` → `chatLink` (Wonderflow). This does nothing if the file isn't there.
+- **Optional pins:** for each JSON file listed in `config.json → pinFiles`, if its `chatLink` points at the replaced chat, it is moved to the new chat. This lets other tools that pin a chat follow it.
 
 ## Known limits
 - Passing a scratch-workspace folder in the link shows the app's "Trust this workspace?" dialog. That is a security prompt, and it is left for the user.

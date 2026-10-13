@@ -44,14 +44,14 @@ func installUpdate() {
     }
 }
 
-struct Config { var ask = 40.0, red = 60.0, group = "Archive", snooze = 20.0, window: Double? = nil
+struct Config { var ask = 40.0, red = 60.0, group = "Archive", snooze = 20.0, window: Double? = nil, pinFiles: [String] = []
     static func load() -> Config {
         var c = Config()
         if let d = FileManager.default.contents(atPath: appDir + "/config.json"),
            let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
             c.ask = (j["askAtPercent"] as? Double) ?? c.ask; c.red = (j["redAtPercent"] as? Double) ?? c.red
             c.group = (j["archiveGroup"] as? String) ?? c.group; c.snooze = (j["snoozeMinutes"] as? Double) ?? c.snooze
-            c.window = j["windowOverride"] as? Double
+            c.window = j["windowOverride"] as? Double; c.pinFiles = (j["pinFiles"] as? [String]) ?? []
         }
         return c
     }
@@ -126,14 +126,17 @@ func archivedIds(_ group: String) -> Set<String> {
     return Set(g.assign.filter { $0.value == gid }.keys)
 }
 
-/// Point Wonderflow's voice pill at the new chat when it was pinned to the one being replaced.
-func retargetWonderflow(from old: String, to new: String) {
-    let path = home + "/MotionMachine/apps/MotionChat/config.json"
+/// Optional: other tools that pin a chat by link (a JSON file with a "chatLink" key, listed in config.json → "pinFiles")
+/// follow the new chat when the pinned one is replaced.
+func retargetPins(from old: String, to new: String) {
+    for raw in Config.load().pinFiles { retargetPin(raw.hasPrefix("~") ? home + raw.dropFirst() : raw, from: old, to: new) }
+}
+func retargetPin(_ path: String, from old: String, to new: String) {
     guard let d = FileManager.default.contents(atPath: path),
           var j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
           let link = j["chatLink"] as? String, link.hasSuffix(old) else { return }
     j["chatLink"] = link.replacingOccurrences(of: old, with: new)
-    if let out = try? JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) { try? out.write(to: URL(fileURLWithPath: path), options: .atomic); log("wonderflow chat link moved \(old) -> \(new)") }
+    if let out = try? JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) { try? out.write(to: URL(fileURLWithPath: path), options: .atomic); log("pinned chat link moved \(old) -> \(new)") }
 }
 
 /// App session id of the newest session with exactly this title, if any.
@@ -605,7 +608,7 @@ final class MeterView: NSView {
             for _ in 0..<90 {                                    // up to ~3 minutes
                 Thread.sleep(forTimeInterval: 2)
                 guard let newId = findSession(title: newTitle, createdAfter: startedMs) else { continue }
-                retargetWonderflow(from: s.appId, to: newId)
+                retargetPins(from: s.appId, to: newId)
                 let g2 = sidebarGroups()
                 if g2.assign[newId] == oldGroupId && g2.assign[s.appId] == archiveId && archiveId != nil { filed = true; break }
                 DispatchQueue.main.async { self.message = "Filing the new chat" }
