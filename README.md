@@ -24,7 +24,7 @@ cd ~/Documents/Claude/ContextMeter && ./build.sh
 6. Optional: put your code-signing identity hash (from `security find-identity -p codesigning`) in a file named `signing-id`, so Accessibility approval survives updates.
 
 ## Updates
-The pill checks GitHub every 3 hours. When there's a new version, a small blue **Update** appears at the bottom-right of the list. Clicking it runs `git pull` and `./build.sh`, and the pill restarts. Your `config.json` and `signing-id` are never touched, since both are git-ignored.
+The pill checks GitHub every hour. When there's a new version and the pill is idle, it installs it by itself: `git pull`, then `./build.sh`, then a restart. If a build fails, the old pill keeps running. A small blue **Update** at the bottom-right of the list does the same by hand. Your `config.json` and `signing-id` are never touched, since both are git-ignored.
 
 To publish a change: edit, run `./build.sh`, test, then `git commit` and `git push`.
 

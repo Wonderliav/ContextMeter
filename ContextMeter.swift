@@ -578,19 +578,54 @@ final class MeterView: NSView {
 
     func copyHandoff() { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(handoffText, forType: .string) }
 
+    /// The Claude Code CLI: the user's own install (login-shell PATH), else the copy the Claude app ships with.
+    static func claudeCLI() -> String? {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/zsh"); p.arguments = ["-lc", "command -v claude"]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
+        if (try? p.run()) != nil {
+            let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            p.waitUntilExit()
+            if out.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: out) { return out }
+        }
+        let root = home + "/Library/Application Support/Claude/claude-code"
+        let vers = ((try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []).sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+        for v in vers {
+            for h in (try? FileManager.default.contentsOfDirectory(atPath: root + "/" + v)) ?? [] {
+                let bin = "\(root)/\(v)/\(h)/claude.app/Contents/MacOS/claude"
+                if FileManager.default.isExecutableFile(atPath: bin) { return bin }
+            }
+        }
+        return nil
+    }
+
     func startHandoff(_ s: Sess) {
         mode = .working; message = "Writing handoff…"; relayout()
         let prompt = "Write a handoff document so a brand-new session can continue exactly where we left off. Sections: Goal, Decisions made, Current state (exact file paths, commands, running processes), Done, Next steps, Open questions, the user's preferences seen in this chat. Dense and specific, no preamble, under 600 words. Output only the markdown."
         DispatchQueue.global().async {
-            let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            p.arguments = ["-lc", "cd \"$CM_CWD\" && claude -p \"$CM_PROMPT\" --resume \"$CM_ID\" --fork-session --output-format text"]
-            var env: [String: String] = ProcessInfo.processInfo.environment
-            env["CM_CWD"] = s.cwd; env["CM_PROMPT"] = prompt; env["CM_ID"] = s.cliId
-            p.environment = env
-            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
-            try? p.run(); let data = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
-            let raw: String = String(data: data, encoding: .utf8) ?? ""
-            let body: String = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            var body = ""
+            if let cli = MeterView.claudeCLI() {
+                let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                p.arguments = ["-lc", "cd \"$CM_CWD\" && \"$CM_CLI\" -p \"$CM_PROMPT\" --resume \"$CM_ID\" --fork-session --output-format text"]
+                var env: [String: String] = ProcessInfo.processInfo.environment
+                env["CM_CWD"] = s.cwd; env["CM_PROMPT"] = prompt; env["CM_ID"] = s.cliId; env["CM_CLI"] = cli
+                p.environment = env
+                let errFile = NSTemporaryDirectory() + "cm-handoff-err.txt"
+                FileManager.default.createFile(atPath: errFile, contents: nil)
+                let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle(forWritingAtPath: errFile); p.standardInput = FileHandle.nullDevice
+                do { try p.run() } catch { log("handoff: cannot run \(cli): \(error)") }
+                let data = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+                body = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                if body.isEmpty || p.terminationStatus != 0 {
+                    let err = (try? String(contentsOfFile: errFile, encoding: .utf8)) ?? ""
+                    log("handoff: \(cli) exit \(p.terminationStatus): \(err.prefix(400).replacingOccurrences(of: "\n", with: " | "))")
+                    if p.terminationStatus != 0 { body = "" }
+                }
+            } else { log("handoff: no Claude Code CLI found (PATH or the Claude app)") }
+            // Never strand the user: if the summary couldn't be written, the new chat reads the old one itself.
+            if body.isEmpty {
+                body = "The automatic summary couldn't be written. Before anything else, read the previous chat yourself: load mcp__ccd_session_mgmt__list_events with ToolSearch, call it on session_id \(s.appId) (page back with before_uuid as needed), then write a short summary of where things stand and continue from there."
+                log("handoff: using read-the-old-chat fallback")
+            }
             DispatchQueue.main.async { self.finishHandoff(s, body) }
         }
     }
@@ -697,8 +732,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let frameTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.view.stepAnim(); if self?.view.mode == .working { self?.view.needsDisplay = true } }
         RunLoop.main.add(frameTimer, forMode: .common)
         view.tick(); Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.view.tick() }
-        checkForUpdate { [weak self] in self?.view.needsDisplay = true }
-        Timer.scheduledTimer(withTimeInterval: 3 * 3600, repeats: true) { [weak self] _ in checkForUpdate { self?.view.needsDisplay = true } }
+        // Updates install themselves while the pill is idle (never mid-Replace); the blue "Update" stays as a manual way.
+        let autoUpdate: () -> Void = { [weak self] in
+            self?.view.needsDisplay = true
+            if updateAvailable, self?.view.mode == .idle { updateAvailable = false; log("update: installing automatically"); installUpdate() }
+        }
+        checkForUpdate(autoUpdate)
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in checkForUpdate(autoUpdate) }
     }
 }
 let app = NSApplication.shared; app.setActivationPolicy(.accessory)
