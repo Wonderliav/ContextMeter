@@ -600,7 +600,7 @@ final class MeterView: NSView {
 
     func startHandoff(_ s: Sess) {
         mode = .working; message = "Writing handoff…"; relayout()
-        let prompt = "Write a handoff document so a brand-new session can continue exactly where we left off. Sections: Goal, Decisions made, Current state (exact file paths, commands, running processes), Done, Next steps, Open questions, the user's preferences seen in this chat. Dense and specific, no preamble, under 600 words. Output only the markdown."
+        let prompt = "Write a handoff document so a brand-new session can continue exactly where we left off. Sections: Goal, Decisions made, Current state (exact file paths, commands, running processes, and every background watcher, Monitor, loop or scheduled task this chat runs with the exact command to restart it), Done, Next steps, Open questions, the user's preferences seen in this chat. Dense and specific, no preamble, under 600 words. Output only the markdown."
         DispatchQueue.global().async {
             var body = ""
             if let cli = MeterView.claudeCLI() {
@@ -611,10 +611,19 @@ final class MeterView: NSView {
                 p.environment = env
                 let errFile = NSTemporaryDirectory() + "cm-handoff-err.txt"
                 FileManager.default.createFile(atPath: errFile, contents: nil)
-                let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle(forWritingAtPath: errFile); p.standardInput = FileHandle.nullDevice
+                let outFile = NSTemporaryDirectory() + "cm-handoff-out.txt"
+                FileManager.default.createFile(atPath: outFile, contents: nil)
+                p.standardOutput = FileHandle(forWritingAtPath: outFile); p.standardError = FileHandle(forWritingAtPath: errFile); p.standardInput = FileHandle.nullDevice
                 do { try p.run() } catch { log("handoff: cannot run \(cli): \(error)") }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
-                body = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                let t0 = Date(), limit: TimeInterval = 240          // a stuck summary never blocks Replace for long
+                while p.isRunning && Date().timeIntervalSince(t0) < limit {
+                    Thread.sleep(forTimeInterval: 1)
+                    let sec = Int(Date().timeIntervalSince(t0))
+                    DispatchQueue.main.async { self.message = "Writing handoff… \(sec)s" }
+                }
+                if p.isRunning { p.terminate(); log("handoff: summary took over \(Int(limit))s, stopped it") }
+                p.waitUntilExit()
+                body = ((try? String(contentsOfFile: outFile, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if body.isEmpty || p.terminationStatus != 0 {
                     let err = (try? String(contentsOfFile: errFile, encoding: .utf8)) ?? ""
                     log("handoff: \(cli) exit \(p.terminationStatus): \(err.prefix(400).replacingOccurrences(of: "\n", with: " | "))")
@@ -641,7 +650,7 @@ final class MeterView: NSView {
         let archiveStep = archiveId.map { "group_id \"\($0)\" (“\(self.cfg.group)”)" } ?? "the group “\(self.cfg.group)” (create it first with create_group if missing)"
         self.handoffText = """
         Continuing from a previous chat (“\(s.title)”, session id \(s.appId)). Context was getting heavy, so we're starting fresh.
-        Do these first, quietly, with no commentary. Load every tool you need in ONE ToolSearch call: select:mcp__ccd_session_mgmt__set_session_title,mcp__ccd_sidebar__move_sessions,mcp__ccd_session_mgmt__get_session,mcp__ccd_session_mgmt__set_session_permission_mode,mcp__ccd_session_mgmt__send_message — then make these calls together in one parallel batch: (1) set_session_title session_id "self" to “\(newTitle)”; \(placeStep) (3) move_sessions session_ids ["\(s.appId)"] to \(archiveStep). Do not archive anything, the group is the archive. Then call get_session with session_id "self" and compare it with the old chat's settings — model “\(s.model)”\(s.effort.isEmpty ? "" : ", effort “\(s.effort)”")\(s.mode.isEmpty ? "" : ", permission mode “\(s.mode)”") — and fix every difference; never assume they match. Fix permission mode yourself with set_session_permission_mode (session_id "self"). A chat can't change its own model or effort, so if either differs, send_message to the old chat (session_id \(s.appId)) asking it to load set_session_model and set_session_effort in one ToolSearch and call them on your session id with the old values, no other work, one-line reply. Then continue from the handoff below — no recap needed.
+        Do these first, quietly, with no commentary. Load every tool you need in ONE ToolSearch call: select:mcp__ccd_session_mgmt__set_session_title,mcp__ccd_sidebar__move_sessions,mcp__ccd_session_mgmt__get_session,mcp__ccd_session_mgmt__set_session_permission_mode,mcp__ccd_session_mgmt__send_message — then make these calls together in one parallel batch: (1) set_session_title session_id "self" to “\(newTitle)”; \(placeStep) (3) move_sessions session_ids ["\(s.appId)"] to \(archiveStep). Do not archive anything, the group is the archive. Then call get_session with session_id "self" and compare it with the old chat's settings — model “\(s.model)”\(s.effort.isEmpty ? "" : ", effort “\(s.effort)”")\(s.mode.isEmpty ? "" : ", permission mode “\(s.mode)”") — and fix every difference; never assume they match. Fix permission mode yourself with set_session_permission_mode (session_id "self"). Then always send_message to the old chat (session_id \(s.appId)) saying it has been replaced by your session id, and asking it to: stop every background task, Monitor, loop, scheduled wakeup or cron it started (TaskStop / ScheduleWakeup stop / CronDelete), ignore any later events or task notifications because the new chat owns the work now, and — only if your model or effort differs from the old values, since a chat can't change its own — load set_session_model and set_session_effort in one ToolSearch and call them on your session id with the old values; no other work, one-line reply. Restart any watchers the handoff lists in this chat yourself. Then continue from the handoff below — no recap needed.
 
         --- HANDOFF ---
         \(body)
