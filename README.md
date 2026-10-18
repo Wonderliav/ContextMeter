@@ -18,7 +18,7 @@ cd ~/Documents/Claude/ContextMeter && ./build.sh
 ```
 1. First run asks for Keychain access to "Claude Code-credentials". Choose **Always Allow**. The app reads it through `/usr/bin/security`, read-only, and never logs it. It is only used to get account usage.
 2. On first launch the pill asks once for **Accessibility** (macOS prompt + the settings page opens) — switch ContextMeter on. With this, Replace presses Return in the new chat itself. Without it, the new chat opens prefilled and you press Return.
-3. System Settings → General → **Login Items** → add `ContextMeter.app`.
+3. It adds itself to **Login Items** on first launch, so it starts with your Mac. You can turn that off in System Settings → General → Login Items, and it won't re-add itself. Only one pill runs at a time.
 4. Optional: set the default permission mode to Auto in Settings → Claude Code, so new chats don't ask to switch modes.
 5. Optional: copy `config.example.json` to `config.json` and change the thresholds. The defaults are used when the file is missing.
 6. Optional: put your code-signing identity hash (from `security find-identity -p codesigning`) in a file named `signing-id`, so Accessibility approval survives updates.

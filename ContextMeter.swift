@@ -2,6 +2,7 @@
 // Past a threshold it asks: "start fresh?" → writes a handoff, copies a ready-to-paste prompt that
 // continues exactly where you left off, renames the new chat "<name> v2" and archives the old one.
 import Cocoa
+import ServiceManagement
 
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 let appDir = Bundle.main.bundleURL.deletingLastPathComponent().path   // the folder holding ContextMeter.app (config, logs, cache)
@@ -701,6 +702,16 @@ final class Panel: NSPanel { override var canBecomeKey: Bool { false } }
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var panel: Panel!, view: MeterView!, rescueScreens: (() -> Void)?
     func applicationDidFinishLaunching(_ n: Notification) {
+        // One pill only: a second copy (login item + manual open, an update relaunch) quits right away.
+        let me = ProcessInfo.processInfo.processIdentifier
+        if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "").contains(where: { $0.processIdentifier != me }) {
+            log("another ContextMeter is running, quitting this one"); NSApp.terminate(nil); return
+        }
+        // Start at login by itself, once per Mac (if the user later turns it off in Login Items, that choice stays).
+        if !UserDefaults.standard.bool(forKey: "loginItemSet") {
+            if SMAppService.mainApp.status != .enabled { do { try SMAppService.mainApp.register(); log("login item registered") } catch { log("login item error \(error)") } }
+            UserDefaults.standard.set(true, forKey: "loginItemSet")
+        }
         let scr = NSScreen.main!.visibleFrame
         panel = Panel(contentRect: NSRect(x: scr.maxX - 190, y: scr.maxY - 60, width: 168, height: 40),
                       styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
