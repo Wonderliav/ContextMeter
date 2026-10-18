@@ -312,17 +312,19 @@ final class MeterView: NSView {
     /// Last good account usage (kept on disk) so the pill never falls back to a chat percent when the login is briefly expired.
     var acct: Acct? = {
         guard let d = FileManager.default.contents(atPath: appDir + "/usage-cache.json"),
-              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let p = j["pct"] as? Double, let sub = j["sub"] as? String, Date().timeIntervalSince1970 - ((j["at"] as? Double) ?? 0) < 6 * 3600 else { return nil }
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let p = j["pct"] as? Double, let sub = j["sub"] as? String else { return nil }
         return Acct(pct: p, sub: sub)
     }(), acctFetched = Date.distantPast, acctBusy = false
-    var headPct: Double { acct?.pct ?? primary?.pct ?? 0 }
-    var headSub: String { acct?.sub ?? shortTok(primary?.tokens ?? 0) }
-    func headColor() -> NSColor { acct != nil ? (headPct >= 85 ? Look.red : headPct >= 65 ? Look.amber : Look.blue) : color(headPct) }
+    // The header is always account money, never a chat's tokens: last known dollars (kept on disk), or a dash until the first reading.
+    var headPct: Double { acct?.pct ?? 0 }
+    var headPctText: String { acct == nil ? "–%" : "\(Int(headPct.rounded()))%" }
+    var headSub: String { acct?.sub ?? "$ –" }
+    func headColor() -> NSColor { acct == nil ? NSColor(white: 0.4, alpha: 1) : headPct >= 85 ? Look.red : headPct >= 65 ? Look.amber : Look.blue }
     func measure(_ s: String, _ size: CGFloat, _ w: NSFont.Weight = .regular) -> CGFloat { (s as NSString).size(withAttributes: [.font: Look.font(size, w)]).width }
     /// Width of the header strip: ring + percent + tokens, sized to its content.
     var headerWidth: CGFloat {
         guard primary != nil || acct != nil else { return 140 }
-        return 42 + measure("\(Int(headPct.rounded()))%", 14, .semibold) + 10 + measure(headSub, 12) + 18
+        return 42 + measure(headPctText, 14, .semibold) + 10 + measure(headSub, 12) + 18
     }
     var primary: Sess? { sessions.first }
     var needsReplace: Bool { (primary?.pct ?? 0) >= cfg.ask }
@@ -447,10 +449,10 @@ final class MeterView: NSView {
         if let p = primary {
             if mode == .working { spinner(NSPoint(x: 24, y: top + 20), 9, Look.blue) }
             else { ring(NSPoint(x: 24, y: top + 20), 9, headPct, headColor(), 3.2) }
-            text("\(Int(headPct.rounded()))%", NSPoint(x: 42, y: top + 11), 14, .white, .semibold)
-            text(headSub, NSPoint(x: 42 + measure("\(Int(headPct.rounded()))%", 14, .semibold) + 10, y: top + 12), 12, NSColor(white: 0.62, alpha: 1))
+            text(headPctText, NSPoint(x: 42, y: top + 11), 14, .white, .semibold)
+            text(headSub, NSPoint(x: 42 + measure(headPctText, 14, .semibold) + 10, y: top + 12), 12, NSColor(white: 0.62, alpha: 1))
             // Chat name only in the ask card, placed after the usage text so they never overlap.
-            let tx = 42 + measure("\(Int(headPct.rounded()))%", 14, .semibold) + 10 + measure(headSub, 12) + 16
+            let tx = 42 + measure(headPctText, 14, .semibold) + 10 + measure(headSub, 12) + 16
             if mode == .asking, cw - tx - 18 > 40 { text(p.title, NSPoint(x: tx, y: top + 12), 12, NSColor(white: 0.45, alpha: 1), width: cw - tx - 18) }
         } else { text("no active chats", NSPoint(x: 16, y: top + 12), 12, NSColor(white: 0.62, alpha: 1)) }
         hits.append((NSRect(x: 0, y: top, width: cw, height: 40), { [weak self] in
