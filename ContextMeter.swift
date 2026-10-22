@@ -354,7 +354,7 @@ enum Look {
     static func font(_ s: CGFloat, _ w: NSFont.Weight = .regular) -> NSFont { NSFont(name: "ABCFavoritSS-Book", size: s) ?? .systemFont(ofSize: s, weight: w) }
 }
 
-enum Mode { case idle, expanded, asking, working, done }
+enum Mode { case idle, expanded, help, asking, working, done }
 
 final class MeterView: NSView {
     var cfg = Config.load(), sessions: [Sess] = [], mode = Mode.idle, message = "", handoffText = ""
@@ -391,7 +391,7 @@ final class MeterView: NSView {
         }
         // Close by itself: the list after the pointer leaves, the finished card after a few seconds.
         let inside = window?.frame.contains(NSEvent.mouseLocation) ?? false
-        if mode == .expanded && pinned < 0 && !profiling {
+        if (mode == .expanded || mode == .help) && pinned < 0 && !profiling {
             if inside { lastInside = now } else if now.timeIntervalSince(lastInside) > 1.0 { mode = .idle; relayout() }
         }
         if mode == .done {
@@ -472,6 +472,24 @@ final class MeterView: NSView {
         }
     }
 
+    /// The short guide: icon key + one line each.
+    let helpRows: [(String, String)] = [
+        ("ring", "Your account this month: % used and dollars"),
+        ("pace", "Where this month is heading · what Replace saved"),
+        ("bar", "How full a chat is. Amber = time to Replace"),
+        ("cold", "Idle 1h+: the next message costs 20–40× more"),
+        ("replace", "Hover a chat → Replace: fresh chat, same work"),
+        ("money", "What that chat has cost so far"),
+        ("top", "Click the top of the pill to open or close"),
+    ]
+    /// Small round "?" at the bottom right: opens the guide, or goes back to the list.
+    func helpButton(active: Bool) {
+        let r = NSRect(x: cw - 14 - 14, y: bounds.height - drawH + 6, width: 14, height: 14)
+        (active ? Look.blue : NSColor(white: 1, alpha: 0.12)).setFill(); NSBezierPath(ovalIn: r).fill()
+        let q = NSAttributedString(string: "?", attributes: [.font: NSFont.systemFont(ofSize: 9, weight: .bold), .foregroundColor: NSColor(white: 1, alpha: active ? 1 : 0.7)])
+        q.draw(at: NSPoint(x: r.midX - q.size().width / 2, y: r.midY - q.size().height / 2))
+        hits.append((r.insetBy(dx: -6, dy: -6), { [weak self] in self?.mode = active ? .expanded : .help; self?.relayout() }))
+    }
     func money(_ x: Double) -> String { x >= 1000 ? String(format: "$%.1fk", x / 1000) : x >= 10 ? String(format: "$%.0f", x) : String(format: "$%.2f", x) }
     /// "On pace for $3.1k this month · saved $42 this week" — red when this month's pace runs past the limit.
     func paceLine() -> (String, NSColor)? {
@@ -495,6 +513,7 @@ final class MeterView: NSView {
         case .expanded:
             h = 40 + paceH + CGFloat(min(sessions.count, 8)) * 26 + 8 + 18   // + pace line + credit line
             w = max(headerWidth + 16, baseListWidth)
+        case .help: h = 40 + 30 + CGFloat(helpRows.count) * 24 + 8 + 18; w = max(headerWidth + 16, baseListWidth)
         case .asking: h = 40 + 124; w = 312
         case .working: h = 40 + 62; w = 312
         case .done: h = 40 + 124; w = 312
@@ -584,7 +603,7 @@ final class MeterView: NSView {
         } else { text("no active chats", NSPoint(x: 16, y: top + 12), 12, NSColor(white: 0.62, alpha: 1)) }
         hits.append((NSRect(x: 0, y: top, width: cw, height: 40), { [weak self] in
             guard let s = self else { return }
-            if s.mode == .idle { s.mode = .expanded } else if s.mode == .expanded || s.mode == .asking || s.mode == .done { s.mode = .idle }
+            if s.mode == .idle { s.mode = .expanded } else if s.mode == .expanded || s.mode == .help || s.mode == .asking || s.mode == .done { s.mode = .idle }
             s.relayout() }))
 
         if drawMode == .asking || drawMode == .done || drawMode == .working {
@@ -635,12 +654,38 @@ final class MeterView: NSView {
             }
             let credit = NSAttributedString(string: "Developed by Liav.T", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor(white: 1, alpha: 0.3)])
             credit.draw(at: NSPoint(x: (cw - credit.size().width) / 2, y: bounds.height - drawH + 8))
+            helpButton(active: false)
             if updateAvailable {
                 let up = NSAttributedString(string: "Update", attributes: [.font: NSFont.systemFont(ofSize: 9, weight: .semibold), .foregroundColor: Look.blue])
-                let r = NSRect(x: cw - 16 - up.size().width, y: bounds.height - drawH + 8, width: up.size().width, height: up.size().height)
+                let r = NSRect(x: 16, y: bounds.height - drawH + 8, width: up.size().width, height: up.size().height)
                 up.draw(at: r.origin)
                 hits.append((r.insetBy(dx: -6, dy: -5), { [weak self] in updateAvailable = false; self?.message = "Updating…"; self?.mode = .working; self?.relayout(); installUpdate() }))
             }
+        case .help:
+            text("What the pill shows", NSPoint(x: 16, y: top - 24), 12, .white, .semibold)
+            for (i, row) in helpRows.enumerated() {
+                let y = top - 30 - 24 * CGFloat(i + 1), mid = NSPoint(x: 26, y: y + 12)
+                switch row.0 {
+                case "ring": ring(mid, 7, 63, Look.blue, 2.6)
+                case "pace": text("↗", NSPoint(x: 20, y: y + 4), 12, NSColor(white: 0.6, alpha: 1))
+                case "bar":
+                    NSColor(white: 1, alpha: 0.14).setFill(); NSBezierPath(roundedRect: NSRect(x: 14, y: y + 9, width: 24, height: 5), xRadius: 2.5, yRadius: 2.5).fill()
+                    Look.amber.setFill(); NSBezierPath(roundedRect: NSRect(x: 14, y: y + 9, width: 15, height: 5), xRadius: 2.5, yRadius: 2.5).fill()
+                case "cold": text("❄", NSPoint(x: 20, y: y + 4), 12, NSColor(calibratedRed: 0.55, green: 0.75, blue: 1, alpha: 1))
+                case "replace":
+                    Look.amber.setFill(); NSBezierPath(ovalIn: NSRect(x: 17, y: y + 3, width: 18, height: 18)).fill()
+                    if let img = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 9, weight: .semibold)) {
+                        let t = img.copy() as! NSImage; t.lockFocus(); NSColor.white.set(); NSRect(origin: .zero, size: t.size).fill(using: .sourceAtop); t.unlockFocus()
+                        t.draw(in: NSRect(x: 26 - t.size.width / 2, y: y + 12 - t.size.height / 2, width: t.size.width, height: t.size.height))
+                    }
+                case "money": text("$", NSPoint(x: 22, y: y + 4), 12, NSColor(white: 0.6, alpha: 1), .semibold)
+                default: text("⌃", NSPoint(x: 21, y: y + 2), 12, NSColor(white: 0.6, alpha: 1))
+                }
+                text(row.1, NSPoint(x: 48, y: y + 5), 11.5, NSColor(white: 0.82, alpha: 1), width: cw - 62)
+            }
+            let credit = NSAttributedString(string: "Developed by Liav.T", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor(white: 1, alpha: 0.3)])
+            credit.draw(at: NSPoint(x: (cw - credit.size().width) / 2, y: bounds.height - drawH + 8))
+            helpButton(active: true)
         case .asking:
             guard let p = primary else { break }
             let bw = (cw - 36 - 12) / 2
@@ -882,7 +927,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if askNow { UserDefaults.standard.set(true, forKey: askedKey)
             if !trusted, let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(u) } }
         if let st = ProcessInfo.processInfo.environment["CM_STATE"] { view.mode = st == "asking" ? .asking : st == "done" ? .done : st == "working" ? .working : .expanded; view.message = "Writing handoff…"; view.frozen = true }
-        if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = .expanded; view.frozen = true }
+        if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = ProcessInfo.processInfo.environment["CM_PROFILE"] == "help" ? .help : .expanded; view.frozen = true }
         if let h = ProcessInfo.processInfo.environment["CM_HOVER"], let n = Int(h) { view.mode = .expanded; view.pinned = n; view.frozen = true }
         if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: home + "/Documents/Claude"); log("testsend \(r)") } }
         let frameTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.view.stepAnim(); if self?.view.mode == .working { self?.view.needsDisplay = true } }

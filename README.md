@@ -5,6 +5,7 @@ A small always-on-top pill for the Claude desktop app (Code tab). It shows:
 - **List:** each Claude Code chat used in the last 7 days, with how full its context window is. Chats in the Archive sidebar group are hidden.
 - **Money:** each chat's cost so far at API list prices (an estimate that leaves out subagent transcripts). A pace line shows "On pace for $3.2k this month", turning red with the date you'd hit your limit, plus "saved $X" from Replace.
 - **❄ Cold chats:** a big chat (100k+ tokens) idle for more than an hour has lost its cache, so the next message re-sends the whole chat at 20–40× the warm price (cache write vs cache read). Replace it instead of continuing.
+- **? guide:** the small ? at the bottom right of the list opens a one-screen key to every icon. Click it again to go back.
 - **Badge:** the number of chats at or above `askAtPercent` that were active in the last 24 h.
 - **Replace** (hover a row): writes a handoff, opens a new chat with it, names it "Name vN", files it in the old chat's sidebar group, moves the old chat to the Archive group, and carries over model, effort and permission mode.
 
