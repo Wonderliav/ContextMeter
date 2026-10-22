@@ -60,6 +60,7 @@ struct Config { var ask = 40.0, red = 60.0, group = "Archive", snooze = 20.0, wi
 
 struct Sess { var appId: String, cliId: String, title: String, cwd: String, model: String, last: Double, tokens: Int = 0, window: Int = 200_000, effort = "", mode = ""
     var cost = 0.0, lastCost = 0.0, lastAt = 0.0, saved = 0.0
+    var busy = false   // mid-turn or touched in the last minute: Replace waits
     var pct: Double { min(100, Double(tokens) / Double(window) * 100) }
     /// Claude Code caches a chat for 1 hour; after that the next message re-sends the whole chat at the cache-write price.
     var cold: Bool { tokens >= 100_000 && lastAt > 0 && Date().timeIntervalSince1970 - lastAt > 3600 }
@@ -121,6 +122,26 @@ func readCost(_ path: String, _ c: ChatCost, _ baseline: Int?) {
       }
       if !more { break }
     }
+}
+
+/// A chat is free to Replace only when its last turn finished (last reply ended with end_turn) and it's been quiet a minute.
+/// Anything else (a tool call in flight, a message just sent) counts as busy, unless it's been silent for 15 minutes.
+func isBusy(_ path: String, lastActivityMs: Double) -> Bool {
+    let quiet = Date().timeIntervalSince1970 - lastActivityMs / 1000
+    if quiet > 900 { return false }
+    if quiet < 60 { return true }
+    guard let h = FileHandle(forReadingAtPath: path) else { return false }
+    defer { try? h.close() }
+    let size = (try? h.seekToEnd()) ?? 0
+    try? h.seek(toOffset: size > 600_000 ? size - 600_000 : 0)
+    guard let data = try? h.readToEnd() else { return false }
+    for line in data.split(separator: 10).reversed() {
+        guard line.range(of: Data("\"isSidechain\":true".utf8)) == nil,
+              line.range(of: Data("\"type\":\"assistant\"".utf8)) != nil || line.range(of: Data("\"type\":\"user\"".utf8)) != nil,
+              let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any], let t = o["type"] as? String, t == "assistant" || t == "user" else { continue }
+        return !(t == "assistant" && ((o["message"] as? [String: Any])?["stop_reason"] as? String) == "end_turn")
+    }
+    return false
 }
 
 /// Replace remembers the old chat's size so the new chat's savings can be counted.
@@ -264,6 +285,7 @@ func loadSessions(_ cfg: Config) -> [Sess] {
         s.window = Int(cfg.window ?? (model.range(of: #"(opus|sonnet|fable)-5"#, options: .regularExpression) != nil || model.contains("[1m]") ? 1_000_000 : 200_000))
         if let p = transcriptPath(cli) { s.tokens = contextTokens(p) }
         if let c = cc { s.cost = c.total; s.lastCost = c.lastCost; s.lastAt = c.lastAt; s.saved = c.saved }
+        if let p = transcriptPath(cli) { s.busy = isBusy(p, lastActivityMs: last) }
         if s.cold { week.coldNow += 1 }
         out.append(s)
     }
@@ -391,6 +413,10 @@ final class MeterView: NSView {
         }
         // Close by itself: the list after the pointer leaves, the finished card after a few seconds.
         let inside = window?.frame.contains(NSEvent.mouseLocation) ?? false
+        if let w = window {
+            let target: CGFloat = inside || mode != .idle ? 1 : 0.5
+            if abs(w.alphaValue - target) > 0.005 { w.alphaValue += (target - w.alphaValue) * min(1, dt * 7) } else if w.alphaValue != target { w.alphaValue = target }
+        }
         if (mode == .expanded || mode == .help) && pinned < 0 && !profiling {
             if inside { lastInside = now } else if now.timeIntervalSince(lastInside) > 1.0 { mode = .idle; relayout() }
         }
@@ -462,7 +488,7 @@ final class MeterView: NSView {
             DispatchQueue.main.async {
                 self.loadBusy = false
                 self.sessions = s
-                if !self.frozen, self.mode == .idle || self.mode == .expanded, let p = s.first, p.pct >= self.cfg.ask,
+                if !self.frozen, self.mode == .idle || self.mode == .expanded, let p = s.first, p.pct >= self.cfg.ask, !p.busy,
                    (self.snoozed[p.appId] ?? .distantPast) < Date(), !self.asked.contains(p.appId) {
                     self.mode = .asking; self.asked.insert(p.appId); NSSound(named: "Tink")?.play()
                 }
@@ -660,7 +686,7 @@ final class MeterView: NSView {
                 if e > 0.02 {                                       // round "back" button grows out of the bar's end
                     let d: CGFloat = 22 * e
                     let c = NSRect(x: bar.maxX + 8 + (1 - e) * 4, y: y + 13 - d / 2, width: d, height: d)
-                    let base: NSColor = s.pct >= cfg.ask ? color(s.pct) : NSColor(white: 1, alpha: 0.22)
+                    let base: NSColor = s.busy ? NSColor(white: 1, alpha: 0.12) : s.pct >= cfg.ask ? color(s.pct) : NSColor(white: 1, alpha: 0.22)   // dim while the chat works
                     base.setFill(); NSBezierPath(ovalIn: c).fill()
                     if let img = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: "Replace chat")?
                         .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11 * e, weight: .semibold)) {
@@ -729,11 +755,20 @@ final class MeterView: NSView {
         }
     }
 
-    override func mouseDown(with e: NSEvent) {
-        let pt = convert(e.locationInWindow, from: nil)
-        if let h = hits.reversed().first(where: { $0.0.contains(pt) }) { h.1(); needsDisplay = true } else { window?.performDrag(with: e) }
+    // A press only counts as a click if the pointer stays put; moving it drags the pill and never opens anything.
+    var pressAt: NSPoint?, dragged = false
+    override func mouseDown(with e: NSEvent) { pressAt = NSEvent.mouseLocation; dragged = false }
+    override func mouseDragged(with e: NSEvent) {
+        guard let p = pressAt, !dragged else { return }
+        let m = NSEvent.mouseLocation
+        if hypot(m.x - p.x, m.y - p.y) > 3 { dragged = true; window?.performDrag(with: e) }
     }
-    override func mouseDragged(with e: NSEvent) { window?.performDrag(with: e) }
+    override func mouseUp(with e: NSEvent) {
+        defer { pressAt = nil }
+        guard !dragged else { dragged = false; return }
+        let pt = convert(e.locationInWindow, from: nil)
+        if let h = hits.reversed().first(where: { $0.0.contains(pt) }) { h.1(); needsDisplay = true }
+    }
 
     enum SendResult { case sent, prefilled, failed }
 
@@ -800,6 +835,11 @@ final class MeterView: NSView {
     }
 
     func startHandoff(_ s: Sess) {
+        if let live = sessions.first(where: { $0.appId == s.appId }), live.busy {
+            message = "“\(s.title)” is still working. Replace once it's done."; mode = .working; relayout()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in if self?.mode == .working { self?.mode = .idle; self?.relayout() } }
+            return
+        }
         mode = .working; message = "Writing handoff…"; relayout()
         let prompt = "Write a handoff document so a brand-new session can continue exactly where we left off. Sections: Goal, Decisions made, Current state (exact file paths, commands, running processes, and every background watcher, Monitor, loop or scheduled task this chat runs with the exact command to restart it), Done, Next steps, Open questions, the user's preferences seen in this chat. Dense and specific, no preamble, under 600 words. Output only the markdown."
         DispatchQueue.global().async {

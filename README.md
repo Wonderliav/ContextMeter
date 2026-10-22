@@ -5,6 +5,8 @@ A small always-on-top pill for the Claude desktop app (Code tab). It shows:
 - **List:** each Claude Code chat used in the last 7 days, with how full its context window is. Chats in the Archive sidebar group are hidden.
 - **Money:** each chat's cost so far at API list prices (an estimate that leaves out subagent transcripts). A pace line shows "On pace for $3.2k this month", turning red with the date you'd hit your limit, plus "saved $X" from Replace.
 - **❄ Cold chats:** a big chat (100k+ tokens) idle for more than an hour has lost its cache, so the next message re-sends the whole chat at 20–40× the warm price (cache write vs cache read). Replace it instead of continuing.
+- **Calm by default:** the pill sits at 50% opacity until you hover it. Dragging moves it without opening anything.
+- **Never mid-work:** Replace, and the automatic ask, only act on a chat whose last turn has finished and that's been quiet for a minute. While a chat works, its Replace arrow is dimmed.
 - **Shrink to a circle:** click the ring to shrink the pill to just the ring, and click the circle to bring it back. An amber dot means a chat wants Replace. It remembers the setting.
 - **? guide:** the small ? at the bottom right of the list opens a one-screen key to every icon. Click it again to go back.
 - **Badge:** the number of chats at or above `askAtPercent` that were active in the last 24 h.
