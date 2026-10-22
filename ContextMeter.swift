@@ -380,10 +380,10 @@ final class MeterView: NSView {
         let now = Date(); let dt = CGFloat(now.timeIntervalSince(lastStep)); lastStep = now
         if let t = tween {                                        // ease the drawn card between sizes
             let p = min(1, CGFloat(now.timeIntervalSince(t.start) / t.dur))
-            let e = bezier(0.65, 0, 0.35, 1, p)
+            let e = tweenFlow ? bezier(0.45, 0, 0.15, 1, p) : bezier(0.65, 0, 0.35, 1, p)   // circle morph: soft start, long calm settle
             drawW = t.fw + (t.tw - t.fw) * e; drawH = t.fh + (t.th - t.fh) * e
             if p >= 1 {
-                tween = nil; drawW = t.tw; drawH = t.th; drawMode = mode
+                tween = nil; tweenFlow = false; drawW = t.tw; drawH = t.th; drawMode = mode
                 let size = CGSize(width: t.tw, height: t.th)       // shrink the window once, at the end
                 if size != lastWindowSize { lastWindowSize = size; onResize?(size) }
             }
@@ -480,7 +480,7 @@ final class MeterView: NSView {
         ("cold", "Idle 1h+: the next message costs 20–40× more"),
         ("replace", "Hover a chat → Replace: fresh chat, same work"),
         ("money", "What that chat has cost so far"),
-        ("top", "Click the top of the pill to open or close"),
+        ("top", "Click the top to open · click the ring to shrink"),
     ]
     /// Small round "?" at the bottom right: opens the guide, or goes back to the list.
     func helpButton(active: Bool) {
@@ -506,10 +506,14 @@ final class MeterView: NSView {
         return parts.isEmpty ? nil : (parts.joined(separator: " · "), c)
     }
 
+    /// Minimised: just the ring, as a 40pt circle (remembered). Click the ring to shrink, click the circle to grow back.
+    var mini = UserDefaults.standard.bool(forKey: "mini") { didSet { UserDefaults.standard.set(mini, forKey: "mini"); tweenFlow = true } }
+    var tweenFlow = false   // the circle morph gets its own softer, slower curve
+
     func relayout() {
         var h: CGFloat = 40, w: CGFloat = headerWidth
         switch mode {
-        case .idle: if needsReplace || otherFull { w += 92 }
+        case .idle: if mini { w = 40 } else if needsReplace || otherFull { w += 92 }
         case .expanded:
             h = 40 + paceH + CGFloat(min(sessions.count, 8)) * 26 + 8 + 18   // + pace line + credit line
             w = max(headerWidth + 16, baseListWidth)
@@ -529,7 +533,7 @@ final class MeterView: NSView {
             let shrinking = h < drawH
             lastTarget = target
             if !shrinking { drawMode = mode }                     // keep old content while closing
-            tween = (drawW, drawH, w, h, Date(), shrinking ? 0.26 : 0.30)
+            tween = (drawW, drawH, w, h, Date(), tweenFlow ? 0.6 : shrinking ? 0.26 : 0.30)
             let big = CGSize(width: max(w, drawW), height: max(h, drawH))
             if big != lastWindowSize { lastWindowSize = big; onResize?(big) }
         } else if tween == nil { drawMode = mode }
@@ -592,9 +596,24 @@ final class MeterView: NSView {
         NSColor(white: 1, alpha: 0.12).setStroke(); card.lineWidth = 1; card.stroke()
         card.addClip()   // content never spills outside the card while it grows or shrinks
         let top = bounds.height - 40   // header strip is the top 40pt (y-up)
+        // m = how far the pill has morphed into the circle (0 = full header, 1 = circle), read from the drawn width.
+        let fullW = headerWidth + ((needsReplace || otherFull) ? 92 : 0)
+        let m: CGFloat = mode == .idle && drawMode == .idle ? max(0, min(1, (fullW - drawW) / max(1, fullW - 40))) : 0
+        let wantsReplace = needsReplace || otherFull
+        if m > 0.001 && wantsReplace {   // amber dot = a chat wants Replace
+            Look.amber.withAlphaComponent(min(1, m * 1.6)).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 27 + 4 * (1 - m), y: top + 26, width: 7, height: 7)).fill()
+        }
+        if m >= 0.999 {
+            ring(NSPoint(x: 20, y: top + 20), 9, headPct, headColor(), 3.2)
+            if wantsReplace { Look.amber.setFill(); NSBezierPath(ovalIn: NSRect(x: 27, y: top + 26, width: 7, height: 7)).fill() }
+            hits.append((NSRect(x: 0, y: top, width: cw, height: 40), { [weak self] in self?.mini = false; self?.relayout() }))
+            return
+        }
         if let p = primary {
             if mode == .working { spinner(NSPoint(x: 24, y: top + 20), 9, Look.blue) }
-            else { ring(NSPoint(x: 24, y: top + 20), 9, headPct, headColor(), 3.2) }
+            else { ring(NSPoint(x: 24 - 4 * m, y: top + 20), 9, headPct, headColor(), 3.2) }
+            NSGraphicsContext.current?.cgContext.setAlpha(max(0, 1 - m * 1.8))   // words and buttons leave first, come back last
             text(headPctText, NSPoint(x: 42, y: top + 11), 14, .white, .semibold)
             text(headSub, NSPoint(x: 42 + measure(headPctText, 14, .semibold) + 10, y: top + 12), 12, NSColor(white: 0.62, alpha: 1))
             // Chat name only in the ask card, placed after the usage text so they never overlap.
@@ -605,16 +624,17 @@ final class MeterView: NSView {
             guard let s = self else { return }
             if s.mode == .idle { s.mode = .expanded } else if s.mode == .expanded || s.mode == .help || s.mode == .asking || s.mode == .done { s.mode = .idle }
             s.relayout() }))
+        if mode == .idle { hits.append((NSRect(x: 4, y: top + 4, width: 40, height: 32), { [weak self] in self?.mini = true; self?.relayout() })) }   // the ring shrinks the pill
 
         if drawMode == .asking || drawMode == .done || drawMode == .working {
             NSColor(white: 1, alpha: 0.08).setFill(); NSRect(x: 18, y: top, width: cw - 36, height: 1).fill()
         }
         if needsReplace, let p = primary, mode != .working, mode != .asking {
-            button("Replace", NSRect(x: cw - 84, y: top + 8, width: 72, height: 24), color(p.pct)) { [weak self] in self?.startHandoff(p) }
+            button("Replace", NSRect(x: (m > 0 ? fullW : cw) - 84, y: top + 8, width: 72, height: 24), color(p.pct)) { [weak self] in self?.startHandoff(p) }
         }
 
         if otherFull && mode == .idle {
-            button("\(fullCount) full", NSRect(x: cw - 84, y: top + 8, width: 72, height: 24), Look.red) { [weak self] in self?.mode = .expanded; self?.relayout() }
+            button("\(fullCount) full", NSRect(x: (m > 0 ? fullW : cw) - 84, y: top + 8, width: 72, height: 24), Look.red) { [weak self] in self?.mode = .expanded; self?.relayout() }
         }
 
         switch drawMode {
@@ -929,6 +949,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let st = ProcessInfo.processInfo.environment["CM_STATE"] { view.mode = st == "asking" ? .asking : st == "done" ? .done : st == "working" ? .working : .expanded; view.message = "Writing handoff…"; view.frozen = true }
         if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = ProcessInfo.processInfo.environment["CM_PROFILE"] == "help" ? .help : .expanded; view.frozen = true }
         if let h = ProcessInfo.processInfo.environment["CM_HOVER"], let n = Int(h) { view.mode = .expanded; view.pinned = n; view.frozen = true }
+        if ProcessInfo.processInfo.environment["CM_MINIDEMO"] != nil { view.frozen = true; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mini.toggle(); v.relayout() } }
         if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: home + "/Documents/Claude"); log("testsend \(r)") } }
         let frameTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.view.stepAnim(); if self?.view.mode == .working { self?.view.needsDisplay = true } }
         RunLoop.main.add(frameTimer, forMode: .common)
