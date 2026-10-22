@@ -3,6 +3,8 @@
 A small always-on-top pill for the Claude desktop app (Code tab). It shows:
 - **Header:** whole-account usage, i.e. the extra-usage budget as a percent and dollars ("$1,615 of $3.5k").
 - **List:** each Claude Code chat used in the last 7 days, with how full its context window is. Chats in the Archive sidebar group are hidden.
+- **Money:** each chat's cost so far at API list prices (an estimate that leaves out subagent transcripts). A pace line shows "On pace for $3.2k this month", turning red with the date you'd hit your limit, plus "saved $X" from Replace.
+- **❄ Cold chats:** a big chat (100k+ tokens) idle for more than an hour has lost its cache, so the next message re-sends the whole chat at about 10x the warm price. Replace it instead of continuing.
 - **Badge:** the number of chats at or above `askAtPercent` that were active in the last 24 h.
 - **Replace** (hover a row): writes a handoff, opens a new chat with it, names it "Name vN", files it in the old chat's sidebar group, moves the old chat to the Archive group, and carries over model, effort and permission mode.
 
@@ -36,7 +38,7 @@ To publish a change: edit, run `./build.sh`, test, then `git commit` and `git pu
 | `build.sh` | Compiles, signs (`signing-id` or ad-hoc), relaunches |
 | `Info.plist` | Bundle info (LSUIElement, so no Dock icon) |
 | `config.json` | `askAtPercent`, `redAtPercent`, `archiveGroup`, `snoozeMinutes`, `windowOverride` (force a context size) |
-| `config.json`, `signing-id`, `debug.log`, `usage-cache.json` | Local only, git-ignored |
+| `config.json`, `signing-id`, `debug.log`, `usage-cache.json`, `stats.json` (weekly spend, top chats, savings), `replaces.json` | Local only, git-ignored |
 
 ## Where the data comes from
 - **Chats:** `~/Library/Application Support/Claude/claude-code-sessions/**/local_*.json` gives title, cwd, model, effort, permissionMode, lastActivityAt, cliSessionId.

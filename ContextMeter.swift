@@ -59,7 +59,88 @@ struct Config { var ask = 40.0, red = 60.0, group = "Archive", snooze = 20.0, wi
 }
 
 struct Sess { var appId: String, cliId: String, title: String, cwd: String, model: String, last: Double, tokens: Int = 0, window: Int = 200_000, effort = "", mode = ""
-    var pct: Double { min(100, Double(tokens) / Double(window) * 100) } }
+    var cost = 0.0, lastCost = 0.0, lastAt = 0.0, saved = 0.0
+    var pct: Double { min(100, Double(tokens) / Double(window) * 100) }
+    /// Claude Code caches a chat for 1 hour; after that the next message re-sends the whole chat at the cache-write price.
+    var cold: Bool { tokens >= 100_000 && lastAt > 0 && Date().timeIntervalSince1970 - lastAt > 3600 }
+    var coldResumeCost: Double { Double(tokens) * modelPrice(model).inp * 2 / 1e6 } }
+
+/// List prices per million tokens (Anthropic API; extra usage is billed at these rates). Cache write 1h = 2x input, 5m = 1.25x.
+struct Price { let inp: Double, out: Double, read: Double }
+func modelPrice(_ model: String) -> Price {
+    let m = model.lowercased()
+    if m.contains("fable") || m.contains("mythos") { return Price(inp: 10, out: 50, read: 0.25) }
+    if m.contains("sonnet") { return Price(inp: 2, out: 10, read: 0.20) }
+    if m.contains("haiku-5") { return Price(inp: 0.10, out: 0.50, read: 0.01) }
+    if m.contains("haiku") { return Price(inp: 1, out: 5, read: 0.10) }
+    return Price(inp: 4, out: 20, read: 0.20)   // Opus 5.5 (and the default)
+}
+
+/// Running money per transcript, read incrementally (only new bytes each tick).
+final class ChatCost { var offset: UInt64 = 0, total = 0.0, lastCost = 0.0, lastId = "", lastDay = "", lastAt = 0.0, saved = 0.0
+    var byDay: [String: Double] = [:], savedByDay: [String: Double] = [:] }
+var chatCosts: [String: ChatCost] = [:]
+let isoFrac: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
+
+/// baseline = context size of the chat this one replaced; every message below it counts as money saved by Replace.
+func updateCost(_ path: String, baseline: Int?) -> ChatCost {
+    let c = chatCosts[path] ?? ChatCost(); chatCosts[path] = c
+    autoreleasepool { readCost(path, c, baseline) }
+    return c
+}
+func readCost(_ path: String, _ c: ChatCost, _ baseline: Int?) {
+    guard let h = FileHandle(forReadingAtPath: path) else { return }
+    defer { try? h.close() }
+    let size = (try? h.seekToEnd()) ?? 0
+    while size > c.offset {
+      let more = autoreleasepool { () -> Bool in
+        try? h.seek(toOffset: c.offset)
+        guard let data = try? h.read(upToCount: 8_000_000), !data.isEmpty, let nl = data.lastIndex(of: 10) else { return false }
+        c.offset += UInt64(nl - data.startIndex + 1)
+        for line in data[data.startIndex..<nl].split(separator: 10) {
+        guard line.count > 200, line.count < 400_000, line.range(of: Data("\"usage\"".utf8)) != nil, line.range(of: Data("\"type\":\"assistant\"".utf8)) != nil,
+              let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any], let m = o["message"] as? [String: Any],
+              let u = m["usage"] as? [String: Any] else { continue }
+        let n: (String) -> Double = { (u[$0] as? Double) ?? Double((u[$0] as? Int) ?? 0) }
+        let pr = modelPrice((m["model"] as? String) ?? "")
+        let cc = u["cache_creation"] as? [String: Any]
+        let w5 = Double((cc?["ephemeral_5m_input_tokens"] as? Int) ?? 0)
+        let w1 = cc == nil ? n("cache_creation_input_tokens") : Double((cc?["ephemeral_1h_input_tokens"] as? Int) ?? 0)
+        var cost = (n("input_tokens") * pr.inp + w5 * pr.inp * 1.25 + w1 * pr.inp * 2 + n("cache_read_input_tokens") * pr.read + n("output_tokens") * pr.out) / 1e6
+        if (u["speed"] as? String) == "fast" { cost *= 2 }
+        let ts = (o["timestamp"] as? String) ?? "", day = String(ts.prefix(10)), id = (m["id"] as? String) ?? ""
+        if !id.isEmpty && id == c.lastId { c.total -= c.lastCost; c.byDay[c.lastDay, default: 0] -= c.lastCost }   // same message, later line: replace it
+        else if let b = baseline, (o["isSidechain"] as? Bool) != true {
+            let ctx = n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens")
+            if Double(b) > ctx { let sv = (Double(b) - ctx) * pr.read / 1e6; c.saved += sv; c.savedByDay[day, default: 0] += sv }
+        }
+        c.total += cost; c.byDay[day, default: 0] += cost; c.lastCost = cost; c.lastId = id; c.lastDay = day
+        if let t = isoFrac.date(from: ts) { c.lastAt = t.timeIntervalSince1970 }
+        }
+        return true
+      }
+      if !more { break }
+    }
+}
+
+/// Replace remembers the old chat's size so the new chat's savings can be counted.
+func replaceBaselines() -> [String: Int] {
+    guard let d = FileManager.default.contents(atPath: appDir + "/replaces.json"), let a = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else { return [:] }
+    var out: [String: Int] = [:]
+    for r in a { if let id = r["newAppId"] as? String, let b = r["baseline"] as? Int { out[id] = b } }
+    return out
+}
+func recordReplace(newAppId: String, baseline: Int) {
+    var a = ((try? JSONSerialization.jsonObject(with: FileManager.default.contents(atPath: appDir + "/replaces.json") ?? Data())) as? [[String: Any]]) ?? []
+    guard !a.contains(where: { ($0["newAppId"] as? String) == newAppId }) else { return }
+    a.append(["newAppId": newAppId, "baseline": baseline, "at": Date().timeIntervalSince1970])
+    if let d = try? JSONSerialization.data(withJSONObject: a) { try? d.write(to: URL(fileURLWithPath: appDir + "/replaces.json")) }
+}
+
+/// Weekly money picture for the pill and the Sunday Slack summary (stats.json next to the app).
+struct WeekStats { var spent = 0.0, saved = 0.0, top: [(String, Double)] = [], coldNow = 0 }
+var weekStats = WeekStats()
+var statsWrittenAt = Date.distantPast
 
 func shortTok(_ n: Int) -> String { n >= 1_000_000 ? String(format: "%.1fM", Double(n) / 1e6) : n >= 1000 ? "\(n / 1000)k" : "\(n)" }
 
@@ -160,18 +241,39 @@ func loadSessions(_ cfg: Config) -> [Sess] {
     let fm = FileManager.default
     guard let en = fm.enumerator(atPath: sessionsRoot) else { return [] }
     let cutoff = Date().timeIntervalSince1970 * 1000 - 7 * 24 * 3600 * 1000   // list chats active in the last week
+    let baselines = replaceBaselines()
+    var week = WeekStats(), perChat: [(String, Double)] = []
+    let days: Set<String> = Set((0..<7).map { String(isoFrac.string(from: Date().addingTimeInterval(-Double($0) * 86400)).prefix(10)) })
     for case let rel as String in en where rel.hasSuffix(".json") && rel.contains("local_") {
         guard let d = fm.contents(atPath: sessionsRoot + "/" + rel),
-              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-              (j["isArchived"] as? Bool) != true, !hidden.contains((j["sessionId"] as? String) ?? ""), let cli = j["cliSessionId"] as? String,
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let cli = j["cliSessionId"] as? String,
               let last = j["lastActivityAt"] as? Double, last > cutoff else { continue }
+        let appId = (j["sessionId"] as? String) ?? ""
+        var cc: ChatCost?
+        if let p = transcriptPath(cli) {
+            let c = updateCost(p, baseline: baselines[appId]); cc = c
+            let w = c.byDay.filter { days.contains($0.key) }.values.reduce(0, +)
+            week.spent += w; week.saved += c.savedByDay.filter { days.contains($0.key) }.values.reduce(0, +)
+            if w > 0.005 { perChat.append(((j["title"] as? String) ?? "Untitled", w)) }
+        }
+        guard (j["isArchived"] as? Bool) != true, !hidden.contains(appId) else { continue }
         let model = (j["model"] as? String) ?? ""
         var s = Sess(appId: (j["sessionId"] as? String) ?? "", cliId: cli, title: (j["title"] as? String) ?? "Untitled",
                      cwd: (j["cwd"] as? String) ?? home, model: model, last: last)
         s.effort = (j["effort"] as? String) ?? ""; s.mode = (j["permissionMode"] as? String) ?? ""
         s.window = Int(cfg.window ?? (model.range(of: #"(opus|sonnet|fable)-5"#, options: .regularExpression) != nil || model.contains("[1m]") ? 1_000_000 : 200_000))
         if let p = transcriptPath(cli) { s.tokens = contextTokens(p) }
+        if let c = cc { s.cost = c.total; s.lastCost = c.lastCost; s.lastAt = c.lastAt; s.saved = c.saved }
+        if s.cold { week.coldNow += 1 }
         out.append(s)
+    }
+    week.top = Array(perChat.sorted { $0.1 > $1.1 }.prefix(5))
+    weekStats = week
+    if Date().timeIntervalSince(statsWrittenAt) > 300 {
+        statsWrittenAt = Date()
+        let j: [String: Any] = ["at": Date().timeIntervalSince1970, "weekSpent": week.spent, "weekSaved": week.saved, "coldNow": week.coldNow,
+                                "top": week.top.map { ["title": $0.0, "cost": $0.1] }]
+        if let d = try? JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted]) { try? d.write(to: URL(fileURLWithPath: appDir + "/stats.json")) }
     }
     return out.sorted { $0.last > $1.last }
 }
@@ -181,7 +283,13 @@ func nextTitle(_ t: String) -> String {
     return t + " v2"
 }
 
-struct Acct { var pct: Double; var sub: String }
+/// "$2,193 of $3.5k" -> (2193, 3500)
+func parseDollars(_ s: String) -> (Double, Double) {
+    let parts = s.replacingOccurrences(of: "$", with: "").replacingOccurrences(of: ",", with: "").components(separatedBy: " of ")
+    func num(_ t: String) -> Double { let t = t.trimmingCharacters(in: .whitespaces); return t.hasSuffix("k") ? (Double(t.dropLast()) ?? 0) * 1000 : Double(t) ?? 0 }
+    return parts.count == 2 ? (num(parts[0]), num(parts[1])) : (0, 0)
+}
+struct Acct { var pct: Double; var sub: String; var used: Double = 0; var limit: Double = 0 }
 
 /// Whole-account usage from Anthropic, using the Claude Code login already in the Keychain (read-only, never logged).
 var cachedToken: String?, cachedExpiry: Double = 0
@@ -222,7 +330,7 @@ func fetchAccount() -> Acct? {
             let f = NumberFormatter(); f.numberStyle = .decimal; f.maximumFractionDigits = 0
             let usedS = f.string(from: NSNumber(value: used)) ?? "0"
             let limS = lim >= 1000 ? String(format: "%.1fk", lim / 1000) : f.string(from: NSNumber(value: lim)) ?? ""
-            result = Acct(pct: u, sub: "$\(usedS) of $\(limS)")
+            result = Acct(pct: u, sub: "$\(usedS) of $\(limS)", used: used, limit: lim)
         }
     }.resume()
     sem.wait()
@@ -265,7 +373,7 @@ final class MeterView: NSView {
     var frozen = false, profiling = ProcessInfo.processInfo.environment["CM_PROFILE"] != nil
     // Hover reveal for the Replace option on a row.
     var rowT = [CGFloat](repeating: 0, count: 8), pinned = -1, lastStep = Date()   // one eased value per row, so scrubbing glides
-    let baseListWidth: CGFloat = 252, revealWidth: CGFloat = 92
+    let baseListWidth: CGFloat = 304, revealWidth: CGFloat = 92, paceH: CGFloat = 20
     func ease(_ t: CGFloat) -> CGFloat { bezier(0.65, 0, 0.35, 1, t) }   // smooth ease in-out
     var sweepStart = Date()
     func stepAnim() {
@@ -307,14 +415,16 @@ final class MeterView: NSView {
     func rowAt(_ pt: NSPoint) -> Int {
         guard mode == .expanded else { return -1 }
         let top = bounds.height - 40
-        for i in 0..<min(sessions.count, 8) where NSRect(x: 0, y: top - 26 * CGFloat(i + 1), width: cw, height: 26).contains(pt) { return i }
+        for i in 0..<min(sessions.count, 8) where NSRect(x: 0, y: top - paceH - 26 * CGFloat(i + 1), width: cw, height: 26).contains(pt) { return i }
         return -1
     }
     /// Last good account usage (kept on disk) so the pill never falls back to a chat percent when the login is briefly expired.
     var acct: Acct? = {
         guard let d = FileManager.default.contents(atPath: appDir + "/usage-cache.json"),
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let p = j["pct"] as? Double, let sub = j["sub"] as? String else { return nil }
-        return Acct(pct: p, sub: sub)
+        var a = Acct(pct: p, sub: sub, used: (j["used"] as? Double) ?? 0, limit: (j["limit"] as? Double) ?? 0)
+        if a.limit == 0 { (a.used, a.limit) = parseDollars(sub) }   // older cache: read "$2,193 of $3.5k"
+        return a
     }(), acctFetched = Date.distantPast, acctBusy = false
     // The header is always account money, never a chat's tokens: last known dollars (kept on disk), or a dash until the first reading.
     var headPct: Double { acct?.pct ?? 0 }
@@ -341,7 +451,7 @@ final class MeterView: NSView {
             DispatchQueue.global().async {
                 let a = fetchAccount()
                 DispatchQueue.main.async {
-                    if let a { self.acct = a; try? JSONSerialization.data(withJSONObject: ["pct": a.pct, "sub": a.sub, "at": Date().timeIntervalSince1970]).write(to: URL(fileURLWithPath: appDir + "/usage-cache.json")) }
+                    if let a { self.acct = a; try? JSONSerialization.data(withJSONObject: ["pct": a.pct, "sub": a.sub, "used": a.used, "limit": a.limit, "at": Date().timeIntervalSince1970]).write(to: URL(fileURLWithPath: appDir + "/usage-cache.json")) }
                     self.acctFetched = Date(); self.acctBusy = false; self.relayout() }
             }
         }
@@ -362,12 +472,28 @@ final class MeterView: NSView {
         }
     }
 
+    func money(_ x: Double) -> String { x >= 1000 ? String(format: "$%.1fk", x / 1000) : x >= 10 ? String(format: "$%.0f", x) : String(format: "$%.2f", x) }
+    /// "On pace for $3.1k this month · saved $42 this week" — red when this month's pace runs past the limit.
+    func paceLine() -> (String, NSColor)? {
+        var parts: [String] = [], c = NSColor(white: 0.55, alpha: 1)
+        if let a = acct, a.limit > 0, a.used > 0, let m = Calendar.current.dateInterval(of: .month, for: Date()) {
+            let el = Date().timeIntervalSince(m.start), frac = max(el / m.duration, 0.02), proj = a.used / frac
+            if proj > a.limit {
+                let hit = m.start.addingTimeInterval(el * a.limit / a.used)
+                let f = DateFormatter(); f.dateFormat = "MMM d"
+                parts.append("At this pace you hit \(money(a.limit)) ~\(f.string(from: hit))"); c = Look.red
+            } else { parts.append("On pace for \(money(proj)) this month") }
+        } else if weekStats.spent > 0 { parts.append("\(money(weekStats.spent)) this week") }
+        if weekStats.saved >= 0.5 { parts.append("saved \(money(weekStats.saved))") }
+        return parts.isEmpty ? nil : (parts.joined(separator: " · "), c)
+    }
+
     func relayout() {
         var h: CGFloat = 40, w: CGFloat = headerWidth
         switch mode {
         case .idle: if needsReplace || otherFull { w += 92 }
         case .expanded:
-            h = 40 + CGFloat(min(sessions.count, 8)) * 26 + 8 + 18   // + the credit line
+            h = 40 + paceH + CGFloat(min(sessions.count, 8)) * 26 + 8 + 18   // + pace line + credit line
             w = max(headerWidth + 16, baseListWidth)
         case .asking: h = 40 + 124; w = 312
         case .working: h = 40 + 62; w = 312
@@ -474,8 +600,9 @@ final class MeterView: NSView {
 
         switch drawMode {
         case .expanded:
+            if let (t, c) = paceLine() { text(t, NSPoint(x: 16, y: top - paceH + 2), 11, c, width: cw - 32) }
             for (i, s) in sessions.prefix(8).enumerated() {
-                let y = top - 26 * CGFloat(i + 1)
+                let y = top - paceH - 26 * CGFloat(i + 1)
                 let e: CGFloat = i < rowT.count ? ease(rowT[i]) : 0
                 if e > 0 { NSColor(white: 1, alpha: 0.07 * e).setFill(); NSBezierPath(roundedRect: NSRect(x: 8, y: y + 1, width: cw - 16, height: 24), xRadius: 9, yRadius: 9).fill() }
                 text(s.title, NSPoint(x: 16, y: y + 4), 12, .white, .regular, width: 112)
@@ -484,7 +611,13 @@ final class MeterView: NSView {
                 let bar = NSRect(x: 134, y: y + 13 - bh / 2, width: tw, height: bh)
                 NSColor(white: 1, alpha: 0.14).setFill(); NSBezierPath(roundedRect: bar, xRadius: bh / 2, yRadius: bh / 2).fill()
                 color(s.pct).setFill(); NSBezierPath(roundedRect: NSRect(x: bar.minX, y: bar.minY, width: max(4, bar.width * CGFloat(s.pct / 100)), height: bh), xRadius: bh / 2, yRadius: bh / 2).fill()
-                if e < 0.98 { text("\(Int(s.pct.rounded()))%", NSPoint(x: 200, y: y + 4), 12, NSColor(white: 0.7, alpha: 1 - e)) }
+                if e < 0.98 {
+                    // ❄ = idle over an hour: the cache is gone, the next message re-sends the whole chat at full price
+                    text(s.cold ? "❄ \(Int(s.pct.rounded()))%" : "\(Int(s.pct.rounded()))%", NSPoint(x: s.cold ? 196 : 200, y: y + 4), 12,
+                         s.cold ? NSColor(calibratedRed: 0.55, green: 0.75, blue: 1, alpha: 1 - e) : NSColor(white: 0.7, alpha: 1 - e))
+                }
+                let money = NSAttributedString(string: money(s.cost), attributes: [.font: Look.font(11), .foregroundColor: NSColor(white: 0.5, alpha: 1)])
+                money.draw(at: NSPoint(x: cw - 14 - money.size().width, y: y + 5))
                 if e > 0.02 {                                       // round "back" button grows out of the bar's end
                     let d: CGFloat = 22 * e
                     let c = NSRect(x: bar.maxX + 8 + (1 - e) * 4, y: y + 13 - d / 2, width: d, height: d)
@@ -682,6 +815,7 @@ final class MeterView: NSView {
                 Thread.sleep(forTimeInterval: 2)
                 guard let newId = findSession(title: newTitle, createdAfter: startedMs) else { continue }
                 retargetPins(from: s.appId, to: newId)
+                recordReplace(newAppId: newId, baseline: s.tokens)
                 let g2 = sidebarGroups()
                 if g2.assign[newId] == oldGroupId && g2.assign[s.appId] == archiveId && archiveId != nil { filed = true; break }
                 DispatchQueue.main.async { self.message = "Filing the new chat" }

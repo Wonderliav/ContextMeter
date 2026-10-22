@@ -4,3 +4,5 @@ signing-id
 debug.log
 usage-cache.json
 .DS_Store
+stats.json
+replaces.json
