@@ -6,3 +6,4 @@ usage-cache.json
 .DS_Store
 stats.json
 replaces.json
+usage-history.json

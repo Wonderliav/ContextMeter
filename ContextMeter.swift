@@ -315,6 +315,25 @@ func parseDollars(_ s: String) -> (Double, Double) {
 }
 struct Acct { var pct: Double; var sub: String; var used: Double = 0; var limit: Double = 0 }
 
+/// Account dollars over time (usage-history.json, about one sample an hour), so the pace follows recent spending, not the month's average.
+var usageHistory: [[Double]] = {
+    guard let d = FileManager.default.contents(atPath: appDir + "/usage-history.json"), let h = try? JSONSerialization.jsonObject(with: d) as? [[Double]] else { return [] }
+    return h.filter { $0.count == 2 }
+}()
+func recordUsage(_ used: Double) {
+    let now = Date().timeIntervalSince1970
+    if let last = usageHistory.last, used < last[1] - 1 { usageHistory = [] }          // the limit reset: start over
+    if let last = usageHistory.last, now - last[0] < 3600 { return }
+    usageHistory.append([now, used]); usageHistory = usageHistory.filter { now - $0[0] < 35 * 86400 }
+    if let d = try? JSONSerialization.data(withJSONObject: usageHistory) { try? d.write(to: URL(fileURLWithPath: appDir + "/usage-history.json")) }
+}
+/// Dollars per second over the last 7 days, once there are at least 36 hours of samples; nil until then.
+func recentRate(_ used: Double) -> Double? {
+    let now = Date().timeIntervalSince1970
+    guard let first = usageHistory.first(where: { now - $0[0] <= 7 * 86400 }), now - first[0] >= 36 * 3600 else { return nil }
+    return max(0, used - first[1]) / (now - first[0])
+}
+
 /// Whole-account usage from Anthropic, using the Claude Code login already in the Keychain (read-only, never logged).
 var cachedToken: String?, cachedExpiry: Double = 0
 
@@ -502,7 +521,7 @@ final class MeterView: NSView {
             DispatchQueue.global().async {
                 let a = fetchAccount()
                 DispatchQueue.main.async {
-                    if let a { self.acct = a; try? JSONSerialization.data(withJSONObject: ["pct": a.pct, "sub": a.sub, "used": a.used, "limit": a.limit, "at": Date().timeIntervalSince1970]).write(to: URL(fileURLWithPath: appDir + "/usage-cache.json")) }
+                    if let a { self.acct = a; recordUsage(a.used); try? JSONSerialization.data(withJSONObject: ["pct": a.pct, "sub": a.sub, "used": a.used, "limit": a.limit, "at": Date().timeIntervalSince1970]).write(to: URL(fileURLWithPath: appDir + "/usage-cache.json")) }
                     self.acctFetched = Date(); self.acctBusy = false; self.relayout() }
             }
         }
@@ -549,12 +568,14 @@ final class MeterView: NSView {
     func paceLine() -> (String, NSColor)? {
         var parts: [String] = [], c = NSColor(white: 0.55, alpha: 1)
         if let a = acct, a.limit > 0, a.used > 0, let m = Calendar.current.dateInterval(of: .month, for: Date()) {
-            let el = Date().timeIntervalSince(m.start), frac = max(el / m.duration, 0.02), proj = a.used / frac
-            if proj > a.limit {
-                let hit = m.start.addingTimeInterval(el * a.limit / a.used)
+            // Last 7 days' spend rate when we have it (reacts to new habits), else the month's average so far.
+            let el = Date().timeIntervalSince(m.start), rate = recentRate(a.used) ?? a.used / max(el, 0.02 * m.duration)
+            let proj = a.used + rate * m.end.timeIntervalSinceNow, wk = recentRate(a.used) != nil ? "this week's" : "this"
+            if a.used >= a.limit { parts.append("Limit reached · \(money(a.used - a.limit)) over"); c = Look.red }
+            else if proj > a.limit {
                 let f = DateFormatter(); f.dateFormat = "MMM d"
-                parts.append("At this pace you hit \(money(a.limit)) ~\(f.string(from: hit))"); c = Look.red
-            } else { parts.append("On pace for \(money(proj)) this month") }
+                parts.append("At \(wk) pace you hit \(money(a.limit)) ~\(f.string(from: Date().addingTimeInterval((a.limit - a.used) / rate)))"); c = Look.red
+            } else { parts.append("On \(wk) pace: \(money(proj)) this month") }
         } else if weekStats.spent > 0 { parts.append("\(money(weekStats.spent)) this week") }
         if weekStats.saved >= 0.5 { parts.append("saved \(money(weekStats.saved))") }
         return parts.isEmpty ? nil : (parts.joined(separator: " · "), c)
