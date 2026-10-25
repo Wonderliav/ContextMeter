@@ -320,14 +320,19 @@ func fetchAccount() -> Acct? {
     // Read through Apple's own `security` tool: its signature never changes, so the Keychain approval survives every rebuild of this app.
     // The token is only held in memory and refreshed when it expires.
     if cachedToken == nil || cachedExpiry < Date().timeIntervalSince1970 * 1000 + 60_000 {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
-        do { try p.run() } catch { log("usage: cannot run security"); return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
-        guard p.terminationStatus == 0,
-              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let o = j["claudeAiOauth"] as? [String: Any], let t = o["accessToken"] as? String else { log("usage: keychain read failed (\(p.terminationStatus))"); return nil }
+        // Stray entries (e.g. account "unknown") can shadow the real login, so try this Mac user's entry first, then any entry.
+        var found: [String: Any]?, status: Int32 = 0
+        for acct in [NSUserName(), nil] as [String?] {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+            p.arguments = ["find-generic-password", "-s", "Claude Code-credentials"] + (acct.map { ["-a", $0] } ?? []) + ["-w"]
+            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice
+            do { try p.run() } catch { log("usage: cannot run security"); return nil }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+            status = p.terminationStatus
+            if status == 0, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let o = j["claudeAiOauth"] as? [String: Any], o["accessToken"] is String { found = o; break }
+        }
+        guard let o = found, let t = o["accessToken"] as? String else { log("usage: keychain read failed (\(status))"); return nil }
         cachedToken = t; cachedExpiry = (o["expiresAt"] as? Double) ?? 0
         if cachedExpiry < Date().timeIntervalSince1970 * 1000 { log("usage: token expired, waiting for Claude to refresh it"); cachedToken = nil; return nil }
     }
