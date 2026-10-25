@@ -21,6 +21,8 @@ func log(_ s: String) {
 var updateAvailable = false
 func git(_ args: [String]) -> (ok: Bool, out: String) {
     let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/git"); p.arguments = ["-C", appDir] + args
+    // Never ask for a login: if the repo moves or goes private, the update check just fails quietly.
+    p.environment = ProcessInfo.processInfo.environment.merging(["GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/usr/bin/true", "SSH_ASKPASS": "/usr/bin/true"]) { $1 }
     let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe; p.standardInput = FileHandle.nullDevice
     do { try p.run() } catch { return (false, "") }
     let d = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
