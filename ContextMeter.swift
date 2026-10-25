@@ -403,8 +403,26 @@ final class MeterView: NSView {
     let baseListWidth: CGFloat = 304, revealWidth: CGFloat = 92, paceH: CGFloat = 20
     func ease(_ t: CGFloat) -> CGFloat { bezier(0.65, 0, 0.35, 1, t) }   // smooth ease in-out
     var sweepStart = Date()
+    // List ↔ guide swap: rows fade and rise in one after another; the "?" lights up under the pointer.
+    var swapStart = Date.distantPast, helpHover: CGFloat = 0, helpRect = NSRect.zero
+    let swapStagger = 0.035, swapDur = 0.34
+    func rowIn(_ i: Int) -> CGFloat {
+        let t = Date().timeIntervalSince(swapStart) - Double(i) * swapStagger
+        return bezier(0.2, 0.7, 0.2, 1, CGFloat(max(0, min(1, t / swapDur))))   // quick out, long soft landing
+    }
+    /// Draws one row of the list or guide at its entrance progress: faded and a few points low until it lands.
+    func entering(_ i: Int, _ body: () -> Void) {
+        let p = rowIn(i)
+        guard p < 1, let cg = NSGraphicsContext.current?.cgContext else { body(); return }
+        cg.saveGState(); cg.setAlpha(p); cg.translateBy(x: 0, y: -7 * (1 - p)); body(); cg.restoreGState()
+    }
     func stepAnim() {
         let now = Date(); let dt = CGFloat(now.timeIntervalSince(lastStep)); lastStep = now
+        if now.timeIntervalSince(swapStart) < swapDur + 10 * swapStagger + 0.05 { needsDisplay = true }
+        if let w = window {
+            let over: CGFloat = (mode == .expanded || mode == .help) && helpRect.insetBy(dx: -6, dy: -6).contains(convert(w.mouseLocationOutsideOfEventStream, from: nil)) ? 1 : 0
+            if helpHover != over { helpHover = over > helpHover ? min(over, helpHover + dt / 0.12) : max(over, helpHover - dt / 0.18); needsDisplay = true }
+        }
         if let t = tween {                                        // ease the drawn card between sizes
             let p = min(1, CGFloat(now.timeIntervalSince(t.start) / t.dur))
             let e = tweenFlow ? bezier(0.45, 0, 0.15, 1, p) : bezier(0.65, 0, 0.35, 1, p)   // circle morph: soft start, long calm settle
@@ -422,7 +440,7 @@ final class MeterView: NSView {
             let target: CGFloat = inside || mode != .idle ? 1 : 0.5
             if abs(w.alphaValue - target) > 0.005 { w.alphaValue += (target - w.alphaValue) * min(1, dt * 7) } else if w.alphaValue != target { w.alphaValue = target }
         }
-        if (mode == .expanded || mode == .help) && pinned < 0 && !profiling {
+        if (mode == .expanded || mode == .help) && pinned < 0 && !profiling && !frozen {
             if inside { lastInside = now } else if now.timeIntervalSince(lastInside) > 1.0 { mode = .idle; relayout() }
         }
         if mode == .done {
@@ -515,11 +533,14 @@ final class MeterView: NSView {
     ]
     /// Small round "?" at the bottom right: opens the guide, or goes back to the list.
     func helpButton(active: Bool) {
-        let r = NSRect(x: cw - 14 - 14, y: bounds.height - drawH + 6, width: 14, height: 14)
-        (active ? Look.blue : NSColor(white: 1, alpha: 0.12)).setFill(); NSBezierPath(ovalIn: r).fill()
-        let q = NSAttributedString(string: "?", attributes: [.font: NSFont.systemFont(ofSize: 9, weight: .bold), .foregroundColor: NSColor(white: 1, alpha: active ? 1 : 0.7)])
+        let base = NSRect(x: cw - 14 - 16, y: bounds.height - drawH + 5, width: 16, height: 16)
+        helpRect = base
+        let h = ease(helpHover), pop = 1 - rowIn(0)                  // grows a little on hover, pulses as the view swaps
+        let r = base.insetBy(dx: -1.5 * h - 2 * pop, dy: -1.5 * h - 2 * pop)
+        (active ? Look.blue : NSColor(white: 1, alpha: 0.12 + 0.16 * h)).setFill(); NSBezierPath(ovalIn: r).fill()
+        let q = NSAttributedString(string: active ? "✕" : "?", attributes: [.font: NSFont.systemFont(ofSize: active ? 8 : 10, weight: .bold), .foregroundColor: NSColor(white: 1, alpha: active ? 1 : 0.7 + 0.3 * h)])
         q.draw(at: NSPoint(x: r.midX - q.size().width / 2, y: r.midY - q.size().height / 2))
-        hits.append((r.insetBy(dx: -6, dy: -6), { [weak self] in self?.mode = active ? .expanded : .help; self?.relayout() }))
+        hits.append((base.insetBy(dx: -10, dy: -8), { [weak self] in self?.mode = active ? .expanded : .help; self?.relayout() }))
     }
     func money(_ x: Double) -> String { x >= 1000 ? String(format: "$%.1fk", x / 1000) : x >= 10 ? String(format: "$%.0f", x) : String(format: "$%.2f", x) }
     /// "On pace for $3.1k this month · saved $42 this week" — red when this month's pace runs past the limit.
@@ -556,6 +577,8 @@ final class MeterView: NSView {
         logicalWidth = w
         let target = CGSize(width: w, height: h)
         if mode == .expanded && prevMode != .expanded { lastInside = Date() }
+        let swap = (mode == .help && prevMode == .expanded) || (mode == .expanded && prevMode == .help)
+        if swap { swapStart = Date(); lastInside = Date() }
         prevMode = mode
         if lastTarget == .zero {                                  // first layout: no animation
             lastTarget = target; drawW = w; drawH = h; drawMode = mode
@@ -563,11 +586,11 @@ final class MeterView: NSView {
         } else if target != lastTarget {
             let shrinking = h < drawH
             lastTarget = target
-            if !shrinking { drawMode = mode }                     // keep old content while closing
+            if !shrinking || swap { drawMode = mode }             // keep old content while closing; list ↔ guide swaps at once
             tween = (drawW, drawH, w, h, Date(), tweenFlow ? 0.6 : shrinking ? 0.26 : 0.30)
             let big = CGSize(width: max(w, drawW), height: max(h, drawH))
             if big != lastWindowSize { lastWindowSize = big; onResize?(big) }
-        } else if tween == nil { drawMode = mode }
+        } else if tween == nil || swap { drawMode = mode }
         needsDisplay = true
     }
 
@@ -670,8 +693,8 @@ final class MeterView: NSView {
 
         switch drawMode {
         case .expanded:
-            if let (t, c) = paceLine() { text(t, NSPoint(x: 16, y: top - paceH + 2), 11, c, width: cw - 32) }
-            for (i, s) in sessions.prefix(8).enumerated() {
+            if let (t, c) = paceLine() { entering(0) { text(t, NSPoint(x: 16, y: top - paceH + 2), 11, c, width: cw - 32) } }
+            for (i, s) in sessions.prefix(8).enumerated() { entering(i + 1) {
                 let y = top - paceH - 26 * CGFloat(i + 1)
                 let e: CGFloat = i < rowT.count ? ease(rowT[i]) : 0
                 if e > 0 { NSColor(white: 1, alpha: 0.07 * e).setFill(); NSBezierPath(roundedRect: NSRect(x: 8, y: y + 1, width: cw - 16, height: 24), xRadius: 9, yRadius: 9).fill() }
@@ -698,11 +721,11 @@ final class MeterView: NSView {
                         let tinted = img.copy() as! NSImage; tinted.lockFocus(); NSColor.white.set()
                         NSRect(origin: .zero, size: tinted.size).fill(using: .sourceAtop); tinted.unlockFocus()
                         let sz = tinted.size
-                        tinted.draw(in: NSRect(x: c.midX - sz.width / 2, y: c.midY - sz.height / 2, width: sz.width, height: sz.height), from: .zero, operation: .sourceOver, fraction: e)
+                        tinted.draw(in: NSRect(x: c.midX - sz.width / 2, y: c.midY - sz.height / 2, width: sz.width, height: sz.height), from: .zero, operation: .sourceOver, fraction: e * rowIn(i + 1))
                     }
                     if e > 0.6 { hits.append((c.insetBy(dx: -5, dy: -5), { [weak self] in self?.startHandoff(s) })) }
                 }
-            }
+            } }
             let credit = NSAttributedString(string: "Developed by Liav.T", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor(white: 1, alpha: 0.3)])
             credit.draw(at: NSPoint(x: (cw - credit.size().width) / 2, y: bounds.height - drawH + 8))
             helpButton(active: false)
@@ -713,8 +736,8 @@ final class MeterView: NSView {
                 hits.append((r.insetBy(dx: -6, dy: -5), { [weak self] in updateAvailable = false; self?.message = "Updating…"; self?.mode = .working; self?.relayout(); installUpdate() }))
             }
         case .help:
-            text("What the pill shows", NSPoint(x: 16, y: top - 24), 12, .white, .semibold)
-            for (i, row) in helpRows.enumerated() {
+            entering(0) { text("What the pill shows", NSPoint(x: 16, y: top - 24), 12, .white, .semibold) }
+            for (i, row) in helpRows.enumerated() { entering(i + 1) {
                 let y = top - 30 - 24 * CGFloat(i + 1), mid = NSPoint(x: 26, y: y + 12)
                 switch row.0 {
                 case "ring": ring(mid, 7, 63, Look.blue, 2.6)
@@ -727,13 +750,13 @@ final class MeterView: NSView {
                     Look.amber.setFill(); NSBezierPath(ovalIn: NSRect(x: 17, y: y + 3, width: 18, height: 18)).fill()
                     if let img = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 9, weight: .semibold)) {
                         let t = img.copy() as! NSImage; t.lockFocus(); NSColor.white.set(); NSRect(origin: .zero, size: t.size).fill(using: .sourceAtop); t.unlockFocus()
-                        t.draw(in: NSRect(x: 26 - t.size.width / 2, y: y + 12 - t.size.height / 2, width: t.size.width, height: t.size.height))
+                        t.draw(in: NSRect(x: 26 - t.size.width / 2, y: y + 12 - t.size.height / 2, width: t.size.width, height: t.size.height), from: .zero, operation: .sourceOver, fraction: rowIn(i + 1))   // images ignore the row fade
                     }
                 case "money": text("$", NSPoint(x: 22, y: y + 4), 12, NSColor(white: 0.6, alpha: 1), .semibold)
                 default: text("⌃", NSPoint(x: 21, y: y + 2), 12, NSColor(white: 0.6, alpha: 1))
                 }
                 text(row.1, NSPoint(x: 48, y: y + 5), 11.5, NSColor(white: 0.82, alpha: 1), width: cw - 62)
-            }
+            } }
             let credit = NSAttributedString(string: "Developed by Liav.T", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor(white: 1, alpha: 0.3)])
             credit.draw(at: NSPoint(x: (cw - credit.size().width) / 2, y: bounds.height - drawH + 8))
             helpButton(active: true)
@@ -994,6 +1017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let st = ProcessInfo.processInfo.environment["CM_STATE"] { view.mode = st == "asking" ? .asking : st == "done" ? .done : st == "working" ? .working : .expanded; view.message = "Writing handoff…"; view.frozen = true }
         if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = ProcessInfo.processInfo.environment["CM_PROFILE"] == "help" ? .help : .expanded; view.frozen = true }
         if let h = ProcessInfo.processInfo.environment["CM_HOVER"], let n = Int(h) { view.mode = .expanded; view.pinned = n; view.frozen = true }
+        if ProcessInfo.processInfo.environment["CM_HELPDEMO"] != nil { view.frozen = true; view.mode = .expanded; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mode = v.mode == .help ? .expanded : .help; v.relayout() } }
         if ProcessInfo.processInfo.environment["CM_MINIDEMO"] != nil { view.frozen = true; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mini.toggle(); v.relayout() } }
         if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: home + "/Documents/Claude"); log("testsend \(r)") } }
         let frameTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.view.stepAnim(); if self?.view.mode == .working { self?.view.needsDisplay = true } }
