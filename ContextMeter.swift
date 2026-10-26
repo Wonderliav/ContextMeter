@@ -424,6 +424,27 @@ final class MeterView: NSView {
     let baseListWidth: CGFloat = 304, revealWidth: CGFloat = 92, paceH: CGFloat = 20
     func ease(_ t: CGFloat) -> CGFloat { bezier(0.65, 0, 0.35, 1, t) }   // smooth ease in-out
     var sweepStart = Date()
+    // Edge dock: drag the pill to a screen edge and it tucks in as a thin line; hover opens it, a coloured line means look at it.
+    var dock = UserDefaults.standard.integer(forKey: "dock")   // -1 left edge, 1 right edge, 0 free
+    var docked: Bool { dock != 0 }
+    var peek = false, peekUntil = Date.distantPast, lastOX: CGFloat = 0
+    let sliverW: CGFloat = 5, edgeReach: CGFloat = 24
+    /// 0 = fine, 1 = amber (a chat is full, or the account passed 65%), 2 = red (a chat is nearly out, or the account passed 85%).
+    var alertLevel: Int {
+        let acctL = (acct?.pct ?? 0) >= 85 ? 2 : (acct?.pct ?? 0) >= 65 ? 1 : 0
+        return max(acctL, chatAlert)
+    }
+    var chatAlert: Int { fullChats.contains { $0.pct >= cfg.red } ? 2 : fullChats.isEmpty ? 0 : 1 }
+    func alertColor() -> NSColor { switch alertLevel { case 2: return Look.red; case 1: return Look.amber; default: return NSColor(white: 1, alpha: 0.5) } }
+    /// Where the card sits inside its window: flush right when docked on the right (the window can be wider than the card mid-animation).
+    func cardOffset() -> CGFloat { dock == 1 ? bounds.width - drawW : 0 }
+    func snapDock() {
+        guard let w = window, let scr = w.screen ?? NSScreen.main else { return }
+        let f = w.frame, e = scr.frame
+        let nd = f.minX <= e.minX + edgeReach ? -1 : f.maxX >= e.maxX - edgeReach ? 1 : 0
+        if nd != dock { dock = nd; UserDefaults.standard.set(nd, forKey: "dock"); peek = nd != 0; peekUntil = Date().addingTimeInterval(0.9); if nd != 0 { mini = false } }
+        relayout(); onResize?(lastWindowSize)
+    }
     // List ↔ guide swap: rows fade and rise in one after another; the "?" lights up under the pointer.
     var swapStart = Date.distantPast, helpHover: CGFloat = 0, helpRect = NSRect.zero
     let swapStagger = 0.035, swapDur = 0.34
@@ -441,7 +462,8 @@ final class MeterView: NSView {
         let now = Date(); let dt = CGFloat(now.timeIntervalSince(lastStep)); lastStep = now
         if now.timeIntervalSince(swapStart) < swapDur + 10 * swapStagger + 0.05 { needsDisplay = true }
         if let w = window {
-            let over: CGFloat = (mode == .expanded || mode == .help) && helpRect.insetBy(dx: -6, dy: -6).contains(convert(w.mouseLocationOutsideOfEventStream, from: nil)) ? 1 : 0
+            var mp = convert(w.mouseLocationOutsideOfEventStream, from: nil); mp.x -= lastOX
+            let over: CGFloat = (mode == .expanded || mode == .help) && helpRect.insetBy(dx: -6, dy: -6).contains(mp) ? 1 : 0
             if helpHover != over { helpHover = over > helpHover ? min(over, helpHover + dt / 0.12) : max(over, helpHover - dt / 0.18); needsDisplay = true }
         }
         if let t = tween {                                        // ease the drawn card between sizes
@@ -458,8 +480,14 @@ final class MeterView: NSView {
         // Close by itself: the list after the pointer leaves, the finished card after a few seconds.
         let inside = window?.frame.contains(NSEvent.mouseLocation) ?? false
         if let w = window {
-            let target: CGFloat = inside || mode != .idle ? 1 : 0.5
+            let target: CGFloat = inside || mode != .idle ? 1 : docked ? (alertLevel > 0 ? 1 : 0.75) : 0.5
             if abs(w.alphaValue - target) > 0.005 { w.alphaValue += (target - w.alphaValue) * min(1, dt * 7) } else if w.alphaValue != target { w.alphaValue = target }
+        }
+        if docked && mode == .idle && !profiling && !frozen {                // the line opens while the pointer is on it, closes half a second after
+            if inside { peekUntil = now.addingTimeInterval(0.5) }
+            let want = inside || now < peekUntil
+            if want != peek { peek = want; relayout() }
+            if !peek && chatAlert > 0 { needsDisplay = true }       // the line breathes while a chat needs Replace
         }
         if (mode == .expanded || mode == .help) && pinned < 0 && !profiling && !frozen {
             if inside { lastInside = now } else if now.timeIntervalSince(lastInside) > 1.0 { mode = .idle; relayout() }
@@ -472,7 +500,7 @@ final class MeterView: NSView {
         var under = -1
         if pinned >= 0 { under = pinned }
         else if profiling { under = Int(Date().timeIntervalSince(sweepStart) / 0.35) % 8 }
-        else if let w = window, w.frame.contains(NSEvent.mouseLocation) { under = rowAt(convert(w.mouseLocationOutsideOfEventStream, from: nil)) }
+        else if let w = window, w.frame.contains(NSEvent.mouseLocation) { var mp = convert(w.mouseLocationOutsideOfEventStream, from: nil); mp.x -= lastOX; under = rowAt(mp) }
         var moved = false
         for i in 0..<rowT.count {
             let target: CGFloat = i == under ? 1 : 0
@@ -508,8 +536,11 @@ final class MeterView: NSView {
         return 42 + measure(headPctText, 14, .semibold) + 10 + measure(headSub, 12) + 18
     }
     var primary: Sess? { sessions.first }
-    var needsReplace: Bool { (primary?.pct ?? 0) >= cfg.ask }
-    var fullCount: Int { sessions.filter { $0.pct >= cfg.ask && $0.last > Date().timeIntervalSince1970 * 1000 - 24 * 3600 * 1000 }.count }
+    /// Chats worth replacing: at or past the Replace line, not archived (loadSessions drops those), used in the last day. The count everywhere comes from here.
+    var fullChats: [Sess] { sessions.filter { $0.pct >= cfg.ask && $0.last > Date().timeIntervalSince1970 * 1000 - 24 * 3600 * 1000 } }
+    var fullCount: Int { fullChats.count }
+    /// Exactly one full chat and it is the one in front: the pill offers Replace for it. Otherwise it shows "N full" and opens the list.
+    var needsReplace: Bool { fullCount == 1 && (primary?.pct ?? 0) >= cfg.ask }
     var otherFull: Bool { !needsReplace && fullCount > 0 }
 
     func color(_ pct: Double) -> NSColor { pct >= cfg.red ? Look.red : pct >= cfg.ask ? Look.amber : Look.blue }
@@ -532,7 +563,7 @@ final class MeterView: NSView {
             DispatchQueue.main.async {
                 self.loadBusy = false
                 self.sessions = s
-                if !self.frozen, self.mode == .idle || self.mode == .expanded, let p = s.first, p.pct >= self.cfg.ask, !p.busy,
+                if !self.frozen, !self.docked, self.mode == .idle || self.mode == .expanded, let p = s.first, p.pct >= self.cfg.ask, !p.busy,
                    (self.snoozed[p.appId] ?? .distantPast) < Date(), !self.asked.contains(p.appId) {
                     self.mode = .asking; self.asked.insert(p.appId); NSSound(named: "Tink")?.play()
                 }
@@ -550,6 +581,7 @@ final class MeterView: NSView {
         ("cold", "Idle 1h+: the next message costs 20–40× more"),
         ("replace", "Hover a chat → Replace: fresh chat, same work"),
         ("money", "What that chat has cost so far"),
+        ("dock", "Drag to a screen edge: hides as a line, hover opens"),
         ("top", "Click the top to open · click the ring to shrink"),
     ]
     /// Small round "?" at the bottom right: opens the guide, or goes back to the list.
@@ -588,7 +620,9 @@ final class MeterView: NSView {
     func relayout() {
         var h: CGFloat = 40, w: CGFloat = headerWidth
         switch mode {
-        case .idle: if mini { w = 40 } else if needsReplace || otherFull { w += 92 }
+        case .idle:
+            if docked && !peek { w = sliverW }
+            else if mini && !docked { w = 40 } else if needsReplace || otherFull { w += 92 }
         case .expanded:
             h = 40 + paceH + CGFloat(min(sessions.count, 8)) * 26 + 8 + 18   // + pace line + credit line
             w = max(headerWidth + 16, baseListWidth)
@@ -668,14 +702,25 @@ final class MeterView: NSView {
             if profiling { drawTimes.append((CACurrentMediaTime() - t0) * 1000); if drawTimes.count == 120 { log("draw ms avg=\(drawTimes.reduce(0, +) / 120) max=\(drawTimes.max() ?? 0)"); drawTimes = [] } }
         }
         hits = []
-        let card = NSBezierPath(roundedRect: NSRect(x: 0, y: bounds.height - drawH, width: cw, height: drawH).insetBy(dx: 0.5, dy: 0.5), xRadius: 20, yRadius: 20)
-        NSColor(calibratedWhite: 0.105, alpha: 1).setFill(); card.fill()
-        NSColor(white: 1, alpha: 0.12).setStroke(); card.lineWidth = 1; card.stroke()
+        lastOX = cardOffset()
+        if lastOX != 0 { NSGraphicsContext.current?.cgContext.translateBy(x: lastOX, y: 0) }
+        // Docked: the card's outer side runs off the screen edge, so it reads as a tab attached to the edge; narrowed to a line it turns into the status colour.
+        var cr = NSRect(x: 0, y: bounds.height - drawH, width: cw, height: drawH)
+        if dock == 1 { cr.size.width += 30 } else if dock == -1 { cr.origin.x -= 30; cr.size.width += 30 }
+        let rad: CGFloat = docked ? min(20, max(2.5, cw / 2)) : 20
+        let line: CGFloat = docked && drawMode == .idle ? max(0, min(1, (drawW - sliverW) / 40)) : 1   // 0 = the line, 1 = the card
+        let pulse: CGFloat = docked && !peek && chatAlert > 0 ? 0.72 + 0.28 * CGFloat(sin(Date().timeIntervalSinceReferenceDate * 2.8)) : 1
+        let card = NSBezierPath(roundedRect: cr.insetBy(dx: 0.5, dy: 0.5), xRadius: rad, yRadius: rad)
+        let base = NSColor(calibratedWhite: 0.105, alpha: 1), lineCol = alertColor().withAlphaComponent(min(1, alertColor().alphaComponent * pulse + (alertLevel > 0 ? 0 : 0)))
+        (line >= 1 ? base : lineCol.blended(withFraction: line, of: base) ?? base).setFill(); card.fill()
+        NSColor(white: 1, alpha: 0.12 * line).setStroke(); card.lineWidth = 1; card.stroke()
         card.addClip()   // content never spills outside the card while it grows or shrinks
+        let dockFade: CGFloat = docked && drawMode == .idle ? max(0, min(1, (drawW - 60) / max(1, headerWidth - 60))) : 1   // words leave first when it folds into the line
+        if dockFade < 1 { NSGraphicsContext.current?.cgContext.setAlpha(dockFade) }
         let top = bounds.height - 40   // header strip is the top 40pt (y-up)
         // m = how far the pill has morphed into the circle (0 = full header, 1 = circle), read from the drawn width.
         let fullW = headerWidth + ((needsReplace || otherFull) ? 92 : 0)
-        let m: CGFloat = mode == .idle && drawMode == .idle ? max(0, min(1, (fullW - drawW) / max(1, fullW - 40))) : 0
+        let m: CGFloat = mode == .idle && drawMode == .idle && !docked ? max(0, min(1, (fullW - drawW) / max(1, fullW - 40))) : 0
         let wantsReplace = needsReplace || otherFull
         if m > 0.001 && wantsReplace {   // amber dot = a chat wants Replace
             Look.amber.withAlphaComponent(min(1, m * 1.6)).setFill()
@@ -690,7 +735,7 @@ final class MeterView: NSView {
         if let p = primary {
             if mode == .working { spinner(NSPoint(x: 24, y: top + 20), 9, Look.blue) }
             else { ring(NSPoint(x: 24 - 4 * m, y: top + 20), 9, headPct, headColor(), 3.2) }
-            NSGraphicsContext.current?.cgContext.setAlpha(max(0, 1 - m * 1.8))   // words and buttons leave first, come back last
+            NSGraphicsContext.current?.cgContext.setAlpha(dockFade * max(0, 1 - m * 1.8))   // words and buttons leave first, come back last
             text(headPctText, NSPoint(x: 42, y: top + 11), 14, .white, .semibold)
             text(headSub, NSPoint(x: 42 + measure(headPctText, 14, .semibold) + 10, y: top + 12), 12, NSColor(white: 0.62, alpha: 1))
             // Chat name only in the ask card, placed after the usage text so they never overlap.
@@ -701,7 +746,7 @@ final class MeterView: NSView {
             guard let s = self else { return }
             if s.mode == .idle { s.mode = .expanded } else if s.mode == .expanded || s.mode == .help || s.mode == .asking || s.mode == .done { s.mode = .idle }
             s.relayout() }))
-        if mode == .idle { hits.append((NSRect(x: 4, y: top + 4, width: 40, height: 32), { [weak self] in self?.mini = true; self?.relayout() })) }   // the ring shrinks the pill
+        if mode == .idle && !docked { hits.append((NSRect(x: 4, y: top + 4, width: 40, height: 32), { [weak self] in self?.mini = true; self?.relayout() })) }   // the ring shrinks the pill
 
         if drawMode == .asking || drawMode == .done || drawMode == .working {
             NSColor(white: 1, alpha: 0.08).setFill(); NSRect(x: 18, y: top, width: cw - 36, height: 1).fill()
@@ -775,6 +820,9 @@ final class MeterView: NSView {
                         let t = img.copy() as! NSImage; t.lockFocus(); NSColor.white.set(); NSRect(origin: .zero, size: t.size).fill(using: .sourceAtop); t.unlockFocus()
                         t.draw(in: NSRect(x: 26 - t.size.width / 2, y: y + 12 - t.size.height / 2, width: t.size.width, height: t.size.height), from: .zero, operation: .sourceOver, fraction: rowIn(i + 1))   // images ignore the row fade
                     }
+                case "dock":
+                    NSColor(white: 1, alpha: 0.14).setFill(); NSBezierPath(roundedRect: NSRect(x: 14, y: y + 3, width: 24, height: 18), xRadius: 3, yRadius: 3).fill()
+                    Look.red.setFill(); NSBezierPath(roundedRect: NSRect(x: 33, y: y + 5, width: 3, height: 14), xRadius: 1.5, yRadius: 1.5).fill()
                 case "money": text("$", NSPoint(x: 22, y: y + 4), 12, NSColor(white: 0.6, alpha: 1), .semibold)
                 default: text("⌃", NSPoint(x: 21, y: y + 2), 12, NSColor(white: 0.6, alpha: 1))
                 }
@@ -812,12 +860,12 @@ final class MeterView: NSView {
     override func mouseDragged(with e: NSEvent) {
         guard let p = pressAt, !dragged else { return }
         let m = NSEvent.mouseLocation
-        if hypot(m.x - p.x, m.y - p.y) > 3 { dragged = true; window?.performDrag(with: e) }
+        if hypot(m.x - p.x, m.y - p.y) > 3 { dragged = true; window?.performDrag(with: e); snapDock() }   // let go near a screen edge → it tucks in as a line
     }
     override func mouseUp(with e: NSEvent) {
         defer { pressAt = nil }
         guard !dragged else { dragged = false; return }
-        let pt = convert(e.locationInWindow, from: nil)
+        var pt = convert(e.locationInWindow, from: nil); pt.x -= lastOX
         if let h = hits.reversed().first(where: { $0.0.contains(pt) }) { h.1(); needsDisplay = true }
     }
 
@@ -1009,19 +1057,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.setFrameAutosaveName("ContextMeterPanel"); panel.isMovableByWindowBackground = false; panel.acceptsMouseMovedEvents = true
         view = MeterView(frame: panel.contentView!.bounds); view.autoresizingMask = [.width, .height]
+        if let d = ProcessInfo.processInfo.environment["CM_DOCK"], let n = Int(d) { view.dock = n }   // test: start docked without saving it
         view.onResize = { [weak self] size in
             guard let p = self?.panel else { return }
             let screen = NSScreen.screens.first(where: { $0.frame.intersects(p.frame) }) ?? NSScreen.main!
             let vis = screen.visibleFrame
-            let x = min(p.frame.minX, vis.maxX - size.width - 8)        // grow to the right, stay on screen
             let top = min(p.frame.maxY, vis.maxY - 8)                    // never tuck under the menu bar
+            let dock = self?.view.dock ?? 0
+            if dock != 0 {                                               // docked: flush with the screen edge, opens inward; a line keeps a few points of hover room
+                let w = max(size.width, 14)
+                p.setFrame(NSRect(x: dock == 1 ? screen.frame.maxX - w : screen.frame.minX, y: max(vis.minY + 8, top - size.height), width: w, height: size.height), display: false, animate: false)
+                return
+            }
+            let x = min(p.frame.minX, vis.maxX - size.width - 8)        // grow to the right, stay on screen
             p.setFrame(NSRect(x: max(vis.minX + 8, x), y: max(vis.minY + 8, top - size.height), width: size.width, height: size.height), display: false, animate: false)
         }
         // If the saved spot is off every screen (display unplugged or rearranged), come back to the main screen's top right.
         func rescue() {
             let p = self.panel!
             let header = NSRect(x: p.frame.minX, y: p.frame.maxY - 40, width: min(p.frame.width, 120), height: 40)
-            if !NSScreen.screens.contains(where: { $0.visibleFrame.contains(NSPoint(x: header.midX, y: header.midY)) }) {
+            if !NSScreen.screens.contains(where: { $0.frame.contains(NSPoint(x: header.midX, y: header.midY)) }) {
                 let vis = NSScreen.main!.visibleFrame
                 p.setFrameTopLeftPoint(NSPoint(x: vis.maxX - p.frame.width - 24, y: vis.maxY - 12))
             }
@@ -1041,6 +1096,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = ProcessInfo.processInfo.environment["CM_PROFILE"] == "help" ? .help : .expanded; view.frozen = true }
         if let h = ProcessInfo.processInfo.environment["CM_HOVER"], let n = Int(h) { view.mode = .expanded; view.pinned = n; view.frozen = true }
         if ProcessInfo.processInfo.environment["CM_HELPDEMO"] != nil { view.frozen = true; view.mode = .expanded; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mode = v.mode == .help ? .expanded : .help; v.relayout() } }
+        if ProcessInfo.processInfo.environment["CM_DOCKDEMO"] != nil { view.frozen = true; Timer.scheduledTimer(withTimeInterval: 1.8, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.peek.toggle(); v.relayout() } }
+        if ProcessInfo.processInfo.environment["CM_SNAPTEST"] != nil { DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in   // test: drop the pill 10pt from the right edge, as a drag would
+            guard let p = self?.panel, let v = self?.view, let e = (p.screen ?? NSScreen.main)?.frame else { return }
+            p.setFrameOrigin(NSPoint(x: e.maxX - p.frame.width - 10, y: p.frame.minY)); v.snapDock(); log("snaptest: dock=\(v.dock) frame=\(p.frame)")
+            p.setFrameOrigin(NSPoint(x: e.midX, y: p.frame.minY)); v.snapDock(); log("snaptest away: dock=\(v.dock) frame=\(p.frame)") } }
         if ProcessInfo.processInfo.environment["CM_MINIDEMO"] != nil { view.frozen = true; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mini.toggle(); v.relayout() } }
         if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: home + "/Documents/Claude"); log("testsend \(r)") } }
         let frameTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.view.stepAnim(); if self?.view.mode == .working { self?.view.needsDisplay = true } }
