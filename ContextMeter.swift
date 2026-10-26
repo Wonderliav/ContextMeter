@@ -438,6 +438,67 @@ final class MeterView: NSView {
     func alertColor() -> NSColor { switch alertLevel { case 2: return Look.red; case 1: return Look.amber; default: return NSColor(white: 1, alpha: 0.5) } }
     /// Where the card sits inside its window: flush right when docked on the right (the window can be wider than the card mid-animation).
     func cardOffset() -> CGFloat { dock == 1 ? bounds.width - drawW : 0 }
+    // Magnetic drag: the pill follows the pointer, is drawn toward a screen edge as it gets close, locks flush (with a trackpad tick),
+    // and when docked it resists being pulled out — a short elastic stretch, then it lets go and glides back to the pointer.
+    var dragging = false, settling = false, dragStuck = false, dragX: CGFloat = 0
+    var dragStartMouse = NSPoint.zero, dragStartOrigin = NSPoint.zero, dragTarget = NSPoint.zero
+    let magnetRange: CGFloat = 80, lockRange: CGFloat = 18, stickPull: CGFloat = 38
+    func tick(_ kind: NSHapticFeedbackManager.FeedbackPattern) { NSHapticFeedbackManager.defaultPerformer.perform(kind, performanceTime: .now) }
+    /// An edge is dockable only if no other screen continues past it at the pill's height, so the pill is never parked on a seam between displays.
+    func edgeIsOuter(_ side: Int, of scr: NSScreen, y: ClosedRange<CGFloat>) -> Bool {
+        let e = scr.frame
+        return !NSScreen.screens.contains { o in
+            o != scr && (side == 1 ? abs(o.frame.minX - e.maxX) < 2 : abs(o.frame.maxX - e.minX) < 2) && o.frame.minY < y.upperBound && o.frame.maxY > y.lowerBound
+        }
+    }
+    func setDock(_ nd: Int, save: Bool) {
+        guard nd != dock else { return }
+        if nd == 0, let w = window, w.frame.width > lastWindowSize.width + 1 {   // leaving the edge: drop the settle margin without the card jumping
+            let extra = w.frame.width - lastWindowSize.width
+            var f = w.frame; f.size.width -= extra
+            if dock == 1 { f.origin.x += extra; dragX += extra; dragTarget.x += extra; dragStartOrigin.x += extra }
+            w.setFrame(f, display: false)
+        }
+        dock = nd; if nd != 0 { mini = false }
+        if save { UserDefaults.standard.set(nd, forKey: "dock") }
+        relayout()
+    }
+    func beginDrag() {
+        guard let w = window else { return }
+        dragging = true; settling = false; dragStuck = docked; peek = true; peekUntil = Date().addingTimeInterval(1)
+        dragStartMouse = NSEvent.mouseLocation; dragStartOrigin = w.frame.origin; dragTarget = w.frame.origin; dragX = w.frame.origin.x
+    }
+    func updateDrag() {
+        guard dragging, let w = window else { return }
+        let m = NSEvent.mouseLocation; peekUntil = Date().addingTimeInterval(1)
+        guard let scr = NSScreen.screens.first(where: { $0.frame.contains(m) }) ?? w.screen ?? NSScreen.main else { return }
+        let e = scr.frame, vis = scr.visibleFrame, ww = w.frame.width, wh = w.frame.height
+        let raw = NSPoint(x: dragStartOrigin.x + m.x - dragStartMouse.x, y: dragStartOrigin.y + m.y - dragStartMouse.y)
+        let flushL = e.minX, flushR = e.maxX - ww
+        var x = raw.x
+        if dragStuck {
+            let flush = dock == 1 ? flushR : flushL, pull = dock == 1 ? flush - raw.x : raw.x - flush
+            if pull > stickPull { dragStuck = false; setDock(0, save: true); tick(.generic) }   // let go
+            else { x = flush + (dock == 1 ? -1 : 1) * max(0, pull) * 0.3 }                      // stretches a little, then lets go
+        }
+        if !dragStuck {
+            let yr = raw.y...(raw.y + wh)
+            let dL = edgeIsOuter(-1, of: scr, y: yr) ? raw.x - flushL : .infinity, dR = edgeIsOuter(1, of: scr, y: yr) ? flushR - raw.x : .infinity
+            let side = dL < dR ? -1 : 1, d = max(0, min(dL, dR)), flush = side == -1 ? flushL : flushR
+            let hold = dock == side ? lockRange + 14 : lockRange     // once locked it takes a bit more to leave
+            if d <= hold { x = flush; if dock != side { setDock(side, save: false); tick(.alignment) } }
+            else {
+                if dock != 0 { setDock(0, save: false) }
+                if d < magnetRange { let t = (magnetRange - d) / (magnetRange - lockRange); x = raw.x + (flush - raw.x) * t * t * (3 - 2 * t) }
+            }
+        }
+        dragTarget = NSPoint(x: x, y: max(vis.minY + 8, min(raw.y, vis.maxY - 8 - wh)))
+    }
+    func finishDrag() {
+        guard dragging else { return }
+        dragging = false; settling = true
+        UserDefaults.standard.set(dock, forKey: "dock")
+    }
     func snapDock() {
         guard let w = window, let scr = w.screen ?? NSScreen.main else { return }
         let f = w.frame, e = scr.frame
@@ -465,6 +526,16 @@ final class MeterView: NSView {
             var mp = convert(w.mouseLocationOutsideOfEventStream, from: nil); mp.x -= lastOX
             let over: CGFloat = (mode == .expanded || mode == .help) && helpRect.insetBy(dx: -6, dy: -6).contains(mp) ? 1 : 0
             if helpHover != over { helpHover = over > helpHover ? min(over, helpHover + dt / 0.12) : max(over, helpHover - dt / 0.18); needsDisplay = true }
+        }
+        if (dragging || settling), let w = window {              // glide the window to where the magnet wants it
+            var o = NSPoint(x: dragX, y: dragTarget.y)   // our own float position: the window snaps to the pixel grid, which would stall the last fraction of a point
+            let k = CGFloat(1 - exp(-Double(dt) * (dragging ? 24 : 14)))
+            o.x += (dragTarget.x - o.x) * k
+            var arrived = false
+            if abs(dragTarget.x - o.x) < 0.4 { o.x = dragTarget.x; if settling { settling = false; arrived = true } }
+            dragX = o.x
+            w.setFrameOrigin(o)
+            if arrived && docked { relayout(); onResize?(lastWindowSize) }   // settled on the edge: take the final docked width and position
         }
         if let t = tween {                                        // ease the drawn card between sizes
             let p = min(1, CGFloat(now.timeIntervalSince(t.start) / t.dur))
@@ -554,6 +625,7 @@ final class MeterView: NSView {
 
     func tick() {
         cfg = Config.load()
+        if docked, !dragging, !settling, let w = window, let scr = w.screen, !edgeIsOuter(dock, of: scr, y: w.frame.minY...w.frame.maxY) { setDock(0, save: true) }   // displays changed: that edge is now a seam
         if !acctBusy, Date().timeIntervalSince(acctFetched) > (acct == nil ? 60 : 120) {
             acctBusy = true
             DispatchQueue.global().async {
@@ -874,13 +946,17 @@ final class MeterView: NSView {
     var pressAt: NSPoint?, dragged = false
     override func mouseDown(with e: NSEvent) { pressAt = NSEvent.mouseLocation; dragged = false }
     override func mouseDragged(with e: NSEvent) {
-        guard let p = pressAt, !dragged else { return }
-        let m = NSEvent.mouseLocation
-        if hypot(m.x - p.x, m.y - p.y) > 3 { dragged = true; window?.performDrag(with: e); snapDock() }   // let go near a screen edge → it tucks in as a line
+        guard let p = pressAt else { return }
+        if !dragged {
+            let m = NSEvent.mouseLocation
+            guard hypot(m.x - p.x, m.y - p.y) > 3 else { return }
+            dragged = true; beginDrag()
+        }
+        updateDrag()
     }
     override func mouseUp(with e: NSEvent) {
         defer { pressAt = nil }
-        guard !dragged else { dragged = false; return }
+        guard !dragged else { dragged = false; finishDrag(); return }
         var pt = convert(e.locationInWindow, from: nil); pt.x -= lastOX
         if let h = hits.reversed().first(where: { $0.0.contains(pt) }) { h.1(); needsDisplay = true }
     }
@@ -1079,6 +1155,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let screen = NSScreen.screens.first(where: { $0.frame.intersects(p.frame) }) ?? NSScreen.main!
             let vis = screen.visibleFrame
             let top = min(p.frame.maxY, vis.maxY - 8)                    // never tuck under the menu bar
+            if self?.view.dragging == true || self?.view.settling == true {   // the drag owns the position; only the size follows
+                p.setFrame(NSRect(x: p.frame.minX, y: p.frame.maxY - size.height, width: size.width, height: size.height), display: false, animate: false); return
+            }
             let dock = self?.view.dock ?? 0
             if dock != 0 {                                               // docked: flush with the screen edge, opens inward; a line keeps a few points of hover room
                 let w = size.width > 20 ? size.width + 18 : 14                  // a little extra room for the card's settle
