@@ -482,14 +482,18 @@ final class MeterView: NSView {
             else { x = flush + (dock == 1 ? -1 : 1) * max(0, pull) * 0.3 }                      // stretches a little, then lets go
         }
         if !dragStuck {
+            // Every screen edge is a place to dock. An edge shared with another display (a seam) pulls less, so crossing between screens
+            // stays easy, and holding ⌥ switches the magnet off altogether.
             let yr = raw.y...(raw.y + wh)
-            let dL = edgeIsOuter(-1, of: scr, y: yr) ? raw.x - flushL : .infinity, dR = edgeIsOuter(1, of: scr, y: yr) ? flushR - raw.x : .infinity
+            let dL = raw.x - flushL, dR = flushR - raw.x
             let side = dL < dR ? -1 : 1, d = max(0, min(dL, dR)), flush = side == -1 ? flushL : flushR
-            let hold = dock == side ? lockRange + 14 : lockRange     // once locked it takes a bit more to leave
-            if d <= hold { x = flush; if dock != side { setDock(side, save: false); tick(.alignment) } }
+            let outer = edgeIsOuter(side, of: scr, y: yr)
+            let range = outer ? magnetRange : 44, lock = outer ? lockRange : 10, hold = dock == side ? lock + (outer ? 14 : 10) : lock   // once locked it takes a bit more to leave
+            if NSEvent.modifierFlags.contains(.option) { if dock != 0 { setDock(0, save: false) } }
+            else if d <= hold { x = flush; if dock != side { setDock(side, save: false); tick(.alignment) } }
             else {
                 if dock != 0 { setDock(0, save: false) }
-                if d < magnetRange { let t = (magnetRange - d) / (magnetRange - lockRange); x = raw.x + (flush - raw.x) * t * t * (3 - 2 * t) }
+                if d < range { let t = (range - d) / (range - lock); x = raw.x + (flush - raw.x) * t * t * (3 - 2 * t) }
             }
         }
         dragTarget = NSPoint(x: x, y: max(vis.minY + 8, min(raw.y, vis.maxY - 8 - wh)))
@@ -625,7 +629,6 @@ final class MeterView: NSView {
 
     func tick() {
         cfg = Config.load()
-        if docked, !dragging, !settling, let w = window, let scr = w.screen, !edgeIsOuter(dock, of: scr, y: w.frame.minY...w.frame.maxY) { setDock(0, save: true) }   // displays changed: that edge is now a seam
         if !acctBusy, Date().timeIntervalSince(acctFetched) > (acct == nil ? 60 : 120) {
             acctBusy = true
             DispatchQueue.global().async {
