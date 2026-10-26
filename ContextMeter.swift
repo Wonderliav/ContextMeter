@@ -131,17 +131,29 @@ func readCost(_ path: String, _ c: ChatCost, _ baseline: Int?) {
 func isBusy(_ path: String, lastActivityMs: Double) -> Bool {
     let quiet = Date().timeIntervalSince1970 - lastActivityMs / 1000
     if quiet > 900 { return false }
-    if quiet < 60 { return true }
     guard let h = FileHandle(forReadingAtPath: path) else { return false }
     defer { try? h.close() }
     let size = (try? h.seekToEnd()) ?? 0
     try? h.seek(toOffset: size > 600_000 ? size - 600_000 : 0)
     guard let data = try? h.readToEnd() else { return false }
+    // Walk back to the last line that says where the chat stands. A finished turn ends with an end_turn reply and then a "system"
+    // (or cost-state) entry; slash commands and interrupted requests leave a user line behind but nothing is running.
     for line in data.split(separator: 10).reversed() {
-        guard line.range(of: Data("\"isSidechain\":true".utf8)) == nil,
-              line.range(of: Data("\"type\":\"assistant\"".utf8)) != nil || line.range(of: Data("\"type\":\"user\"".utf8)) != nil,
-              let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any], let t = o["type"] as? String, t == "assistant" || t == "user" else { continue }
-        return !(t == "assistant" && ((o["message"] as? [String: Any])?["stop_reason"] as? String) == "end_turn")
+        guard line.range(of: Data("\"isSidechain\":true".utf8)) == nil, line.range(of: Data("\"type\":\"api-request".utf8)) == nil,
+              ["assistant", "user", "system", "cost-state"].contains(where: { line.range(of: Data("\"type\":\"\($0)\"".utf8)) != nil }),
+              let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any], let t = o["type"] as? String else { continue }
+        switch t {
+        case "system", "cost-state": return quiet < 10            // the turn closed; only a brief grace for a follow-up
+        case "assistant":
+            let stop = (o["message"] as? [String: Any])?["stop_reason"] as? String
+            return stop == nil || stop == "tool_use" ? true : quiet < 10   // mid-answer or a tool is running
+        case "user":
+            let c = (o["message"] as? [String: Any])?["content"]
+            let text = (c as? String) ?? ((c as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined(separator: " ") ?? "")
+            if text.hasPrefix("<command-") || text.hasPrefix("<local-command") || text.contains("[Request interrupted") { return false }
+            return true
+        default: continue
+        }
     }
     return false
 }
@@ -986,7 +998,9 @@ final class MeterView: NSView {
         var allowed = CharacterSet.urlQueryAllowed; allowed.remove(charactersIn: "&=+#?")
         guard text.count < 13_000, let q = text.addingPercentEncoding(withAllowedCharacters: allowed),
               let f = cwd.addingPercentEncoding(withAllowedCharacters: allowed),
-              let url = URL(string: "claude://code/new?q=\(q)&folder=\(f)") else { log("link: handoff too long or bad url"); return .failed }
+              // A scratch workspace is private to the old chat and asks "trust this folder?" when reopened by link; without a folder the app
+              // starts the new chat in a fresh scratch workspace of its own, which needs no question.
+              let url = URL(string: "claude://code/new?q=\(q)" + (cwd.contains("/scratch-workspaces/") ? "" : "&folder=\(f)")) else { log("link: handoff too long or bad url"); return .failed }
         DispatchQueue.main.sync { NSWorkspace.shared.open(url) }
         guard AXIsProcessTrusted() else { log("link opened; Accessibility not trusted, left for manual Return"); return .prefilled }
         // Press Return only when Claude's message box has focus and holds the handoff, never on a dialog or another app.
@@ -1200,7 +1214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             p.setFrameOrigin(NSPoint(x: e.maxX - p.frame.width - 10, y: p.frame.minY)); v.snapDock(); log("snaptest: dock=\(v.dock) frame=\(p.frame)")
             p.setFrameOrigin(NSPoint(x: e.midX, y: p.frame.minY)); v.snapDock(); log("snaptest away: dock=\(v.dock) frame=\(p.frame)") } }
         if ProcessInfo.processInfo.environment["CM_MINIDEMO"] != nil { view.frozen = true; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mini.toggle(); v.relayout() } }
-        if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: home + "/Documents/Claude"); log("testsend \(r)") } }
+        if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: ProcessInfo.processInfo.environment["CM_TESTSEND"] == "scratch" ? sessionsRoot.replacingOccurrences(of: "claude-code-sessions", with: "scratch-workspaces/test") : home + "/Documents/Claude"); log("testsend \(r)") } }
         let frameTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.view.stepAnim(); if self?.view.mode == .working { self?.view.needsDisplay = true } }
         RunLoop.main.add(frameTimer, forMode: .common)
         view.tick(); Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.view.tick() }
