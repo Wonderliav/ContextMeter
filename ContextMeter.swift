@@ -468,7 +468,11 @@ final class MeterView: NSView {
         }
         if let t = tween {                                        // ease the drawn card between sizes
             let p = min(1, CGFloat(now.timeIntervalSince(t.start) / t.dur))
-            let e = tweenFlow ? bezier(0.45, 0, 0.15, 1, p) : bezier(0.65, 0, 0.35, 1, p)   // circle morph: soft start, long calm settle
+            let edge = docked && mode == .idle && (t.fw <= sliverW + 0.5 || t.tw <= sliverW + 0.5)
+            let opening = t.tw > t.fw
+            let e = edge && opening ? 1 - exp(-6 * p) * (cos(6.2 * p) + 0.968 * sin(6.2 * p))   // line → pill: a soft start, a quick pull out, one small settle (damped spring)
+                  : edge ? bezier(0.5, 0, 0.2, 1, p)                                          // pill → line: eased fold, words leave first
+                  : tweenFlow ? bezier(0.45, 0, 0.15, 1, p) : bezier(0.65, 0, 0.35, 1, p)   // circle morph: soft start, long calm settle
             drawW = t.fw + (t.tw - t.fw) * e; drawH = t.fh + (t.th - t.fh) * e
             if p >= 1 {
                 tween = nil; tweenFlow = false; drawW = t.tw; drawH = t.th; drawMode = mode
@@ -479,13 +483,16 @@ final class MeterView: NSView {
         }
         // Close by itself: the list after the pointer leaves, the finished card after a few seconds.
         let inside = window?.frame.contains(NSEvent.mouseLocation) ?? false
+        var zone = window?.frame ?? .zero
+        if docked && !peek && mode == .idle { zone = zone.insetBy(dx: -18, dy: -12) }          // the line wakes up as the pointer nears it
+        let near = zone.contains(NSEvent.mouseLocation)
         if let w = window {
             let target: CGFloat = inside || mode != .idle ? 1 : docked ? (alertLevel > 0 ? 1 : 0.75) : 0.5
             if abs(w.alphaValue - target) > 0.005 { w.alphaValue += (target - w.alphaValue) * min(1, dt * 7) } else if w.alphaValue != target { w.alphaValue = target }
         }
         if docked && mode == .idle && !profiling && !frozen {                // the line opens while the pointer is on it, closes half a second after
-            if inside { peekUntil = now.addingTimeInterval(0.5) }
-            let want = inside || now < peekUntil
+            if near { peekUntil = now.addingTimeInterval(0.5) }
+            let want = near || now < peekUntil
             if want != peek { peek = want; relayout() }
             if !peek && chatAlert > 0 { needsDisplay = true }       // the line breathes while a chat needs Replace
         }
@@ -644,7 +651,8 @@ final class MeterView: NSView {
             let shrinking = h < drawH
             lastTarget = target
             if !shrinking || swap { drawMode = mode }             // keep old content while closing; list ↔ guide swaps at once
-            tween = (drawW, drawH, w, h, Date(), tweenFlow ? 0.6 : shrinking ? 0.26 : 0.30)
+            let edgeMove = docked && mode == .idle && (drawW <= sliverW + 0.5 || w <= sliverW + 0.5)
+            tween = (drawW, drawH, w, h, Date(), edgeMove ? (w > drawW ? 0.7 : 0.4) : tweenFlow ? 0.6 : shrinking ? 0.26 : 0.30)
             let big = CGSize(width: max(w, drawW), height: max(h, drawH))
             if big != lastWindowSize { lastWindowSize = big; onResize?(big) }
         } else if tween == nil || swap { drawMode = mode }
@@ -708,15 +716,23 @@ final class MeterView: NSView {
         var cr = NSRect(x: 0, y: bounds.height - drawH, width: cw, height: drawH)
         if dock == 1 { cr.size.width += 30 } else if dock == -1 { cr.origin.x -= 30; cr.size.width += 30 }
         let rad: CGFloat = docked ? min(20, max(2.5, cw / 2)) : 20
-        let line: CGFloat = docked && drawMode == .idle ? max(0, min(1, (drawW - sliverW) / 40)) : 1   // 0 = the line, 1 = the card
+        let line: CGFloat = docked && drawMode == .idle ? max(0, min(1, (drawW - sliverW) / 30)) : 1   // 0 = the line, 1 = the card
         let pulse: CGFloat = docked && !peek && chatAlert > 0 ? 0.72 + 0.28 * CGFloat(sin(Date().timeIntervalSinceReferenceDate * 2.8)) : 1
         let card = NSBezierPath(roundedRect: cr.insetBy(dx: 0.5, dy: 0.5), xRadius: rad, yRadius: rad)
-        let base = NSColor(calibratedWhite: 0.105, alpha: 1), lineCol = alertColor().withAlphaComponent(min(1, alertColor().alphaComponent * pulse + (alertLevel > 0 ? 0 : 0)))
-        (line >= 1 ? base : lineCol.blended(withFraction: line, of: base) ?? base).setFill(); card.fill()
+        NSColor(calibratedWhite: 0.105, alpha: 1).setFill(); card.fill()
         NSColor(white: 1, alpha: 0.12 * line).setStroke(); card.lineWidth = 1; card.stroke()
         card.addClip()   // content never spills outside the card while it grows or shrinks
-        let dockFade: CGFloat = docked && drawMode == .idle ? max(0, min(1, (drawW - 60) / max(1, headerWidth - 60))) : 1   // words leave first when it folds into the line
-        if dockFade < 1 { NSGraphicsContext.current?.cgContext.setAlpha(dockFade) }
+        if docked {      // the status line stays on the attached side as the card opens, so the card reads as growing out of the line
+            let sw = 5 - 2 * line
+            let r = NSRect(x: dock == 1 ? cw - sw : -30, y: bounds.height - drawH, width: dock == 1 ? sw + 30 : sw + 30, height: drawH)
+            alertColor().withAlphaComponent(alertLevel > 0 ? pulse : 1).setFill(); r.fill()
+        }
+        let opened: CGFloat = docked && drawMode == .idle ? max(0, min(1, (drawW - 0.4 * headerWidth) / max(1, 0.6 * headerWidth))) : 1   // words arrive once the card is mostly out, leave first on the way back
+        let dockFade = opened * opened * (3 - 2 * opened)
+        if dockFade < 1 {
+            let cg = NSGraphicsContext.current?.cgContext
+            cg?.setAlpha(dockFade); cg?.translateBy(x: (1 - dockFade) * 16 * (dock == 1 ? 1 : -1), y: 0)   // they slide in from the edge
+        }
         let top = bounds.height - 40   // header strip is the top 40pt (y-up)
         // m = how far the pill has morphed into the circle (0 = full header, 1 = circle), read from the drawn width.
         let fullW = headerWidth + ((needsReplace || otherFull) ? 92 : 0)
@@ -1065,7 +1081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let top = min(p.frame.maxY, vis.maxY - 8)                    // never tuck under the menu bar
             let dock = self?.view.dock ?? 0
             if dock != 0 {                                               // docked: flush with the screen edge, opens inward; a line keeps a few points of hover room
-                let w = max(size.width, 14)
+                let w = size.width > 20 ? size.width + 18 : 14                  // a little extra room for the card's settle
                 p.setFrame(NSRect(x: dock == 1 ? screen.frame.maxX - w : screen.frame.minX, y: max(vis.minY + 8, top - size.height), width: w, height: size.height), display: false, animate: false)
                 return
             }
