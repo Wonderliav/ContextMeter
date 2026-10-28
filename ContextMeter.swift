@@ -429,6 +429,7 @@ enum Mode { case idle, expanded, help, settings, asking, working, done }
 final class MeterView: NSView {
     var cfg = Config.load(), sessions: [Sess] = [], mode = Mode.idle, message = "", handoffText = ""
     var doneTitle = "Copied to clipboard ✓", doneSub = "Open a new chat and paste (⌘V)."
+    var doneSuggest: String?, pendingSuggest: (model: String, effort: String, why: String)?
     var snoozed: [String: Date] = [:], asked = Set<String>()
     var hits: [(NSRect, () -> Void)] = []
     var onResize: ((CGSize) -> Void)?
@@ -769,7 +770,7 @@ final class MeterView: NSView {
         case .settings: h = 40 + 30 + 68 + 44 + 26; w = max(headerWidth + 16, baseListWidth)
         case .asking: h = 40 + 124; w = 312
         case .working: h = 40 + 62; w = 312
-        case .done: h = 40 + 124; w = 312
+        case .done: h = 40 + 124 + (doneSuggest == nil ? 0 : 24); w = 312
         }
         logicalWidth = w
         let target = CGSize(width: w, height: h)
@@ -1025,8 +1026,10 @@ final class MeterView: NSView {
             let bw = (cw - 36 - 12) / 2
             text(doneTitle, NSPoint(x: 18, y: top - 34), 14, .white, .semibold)
             text(doneSub, NSPoint(x: 18, y: top - 56), 11.5, NSColor(white: 0.62, alpha: 1), width: cw - 36)
-            button("Copy again", NSRect(x: 18, y: top - 108, width: bw, height: 34), NSColor(white: 1, alpha: 0.12)) { [weak self] in self?.copyHandoff() }
-            button("Show file", NSRect(x: 18 + bw + 12, y: top - 108, width: bw, height: 34), NSColor(white: 1, alpha: 0.12)) { NSWorkspace.shared.open(URL(fileURLWithPath: handoffDir)) }
+            var by = top - 108
+            if let sg = doneSuggest { text(sg, NSPoint(x: 18, y: top - 78), 11.5, Look.blue, .medium, width: cw - 36); by -= 24 }
+            button("Copy again", NSRect(x: 18, y: by, width: bw, height: 34), NSColor(white: 1, alpha: 0.12)) { [weak self] in self?.copyHandoff() }
+            button("Show file", NSRect(x: 18 + bw + 12, y: by, width: bw, height: 34), NSColor(white: 1, alpha: 0.12)) { NSWorkspace.shared.open(URL(fileURLWithPath: handoffDir)) }
         case .idle: break
         }
     }
@@ -1154,8 +1157,8 @@ final class MeterView: NSView {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in if self?.mode == .working { self?.mode = .idle; self?.relayout() } }
             return
         }
-        mode = .working; message = "Writing handoff…"; relayout()
-        let prompt = "Write a handoff document so a brand-new session can continue exactly where we left off. Sections: Goal, Decisions made, Current state (exact file paths, commands, running processes, and every background watcher, Monitor, loop or scheduled task this chat runs with the exact command to restart it), Done, Next steps, Open questions, the user's preferences seen in this chat. Dense and specific, no preamble, under 600 words. Output only the markdown."
+        mode = .working; message = "Writing handoff…"; doneSuggest = nil; pendingSuggest = nil; relayout()
+        let prompt = "Write a handoff document so a brand-new session can continue exactly where we left off. Sections: Goal, Decisions made, Current state (exact file paths, commands, running processes, and every background watcher, Monitor, loop or scheduled task this chat runs with the exact command to restart it), Done, Next steps, Open questions, the user's preferences seen in this chat. Dense and specific, no preamble, under 600 words. Output only the markdown. Then, as the very last line, add exactly: SUGGESTED SETUP: model=<claude-opus-5-5 or claude-sonnet-5-5 or claude-haiku-5-5 or claude-fable-5-1> effort=<low or medium or high or xhigh or max> | <why, at most 12 words>. Pick it from the work that comes NEXT, not the work done: the cheapest model and effort that will still do it well. Mostly file edits, runs and checks: Sonnet medium. Design taste, planning or hard debugging: Opus high. Only the very hardest reasoning: Fable. Trivial chores: Haiku."
         DispatchQueue.global().async {
             var body = ""
             if let cli = MeterView.claudeCLI() {
@@ -1190,14 +1193,42 @@ final class MeterView: NSView {
                 body = "The automatic summary couldn't be written. Before anything else, read the previous chat yourself: load mcp__ccd_session_mgmt__list_events with ToolSearch, call it on session_id \(s.appId) (page back with before_uuid as needed), then write a short summary of where things stand and continue from there."
                 log("handoff: using read-the-old-chat fallback")
             }
-            DispatchQueue.main.async { self.finishHandoff(s, body) }
+            let split = self.splitSuggestion(body)
+            DispatchQueue.main.async { self.pendingSuggest = split.sug; self.finishHandoff(s, split.body) }
         }
     }
 
+    /// "claude-opus-5-5" → "Opus 5.5"
+    func modelName(_ id: String) -> String {
+        let parts = id.replacingOccurrences(of: "claude-", with: "").split(separator: "-").map(String.init)
+        guard let f = parts.first else { return id }
+        let ver = parts.dropFirst().prefix(while: { Int($0) != nil }).joined(separator: ".")
+        return f.prefix(1).uppercased() + f.dropFirst() + (ver.isEmpty ? "" : " " + ver)
+    }
+    /// Pulls the "SUGGESTED SETUP: model=… effort=… | why" line off the end of the handoff, if the summary wrote one.
+    func splitSuggestion(_ text: String) -> (body: String, sug: (model: String, effort: String, why: String)?) {
+        var lines = text.components(separatedBy: "\n")
+        guard let i = lines.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces).uppercased().hasPrefix("SUGGESTED SETUP:") }) else { return (text, nil) }
+        let line = lines.remove(at: i)
+        func val(_ k: String) -> String? { line.range(of: k + "=").map { String(line[$0.upperBound...].prefix(while: { !$0.isWhitespace && $0 != "|" })) } }
+        let why = line.split(separator: "|", maxSplits: 1).dropFirst().first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        let body = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let m = val("model"), let e = val("effort"), m.hasPrefix("claude-") else { return (body, nil) }
+        return (body, (m, e.lowercased(), why))
+    }
     func finishHandoff(_ s: Sess, _ body: String) {
         guard !body.isEmpty else { self.message = "Handoff failed — try again"; self.mode = .working; self.relayout()
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.mode = .asking; self.relayout() }; return }
         let newTitle = nextTitle(s.title)
+        let sug = pendingSuggest; pendingSuggest = nil
+        let carried = "\(modelName(s.model))\(s.effort.isEmpty ? "" : " · " + s.effort)"
+        var suggestStep = ""
+        if let sg = sug {
+            let sgName = "\(modelName(sg.model)) · \(sg.effort)", same = sg.model == s.model && (s.effort.isEmpty || sg.effort == s.effort)
+            doneSuggest = same ? "Setup fits the next steps ✓  \(sgName)" : "Suggested: \(sgName) — \(sg.why)"
+            if !same { suggestStep = " After those steps, keep the carried-over settings (never switch by yourself) and add exactly one short line to your first reply: “Suggested for this chat: \(sgName) — \(sg.why). Say switch and I'll apply it.” If I say switch, send_message to the old chat (session_id \(s.appId)) asking it to call set_session_model and set_session_effort on your session id with model “\(sg.model)” and effort “\(sg.effort)” (a chat can't change its own), then tell me it's done." }
+        }
+        _ = carried
         let g = sidebarGroups()
         let oldGroupId = g.assign[s.appId]
         let archiveId = g.names.first(where: { $0.value == self.cfg.group })?.key
@@ -1205,7 +1236,7 @@ final class MeterView: NSView {
         let archiveStep = archiveId.map { "group_id \"\($0)\" (“\(self.cfg.group)”)" } ?? "the group “\(self.cfg.group)” (create it first with create_group if missing)"
         self.handoffText = """
         Continuing from a previous chat (“\(s.title)”, session id \(s.appId)). Context was getting heavy, so we're starting fresh.
-        Do these first, quietly, with no commentary. Load every tool you need in ONE ToolSearch call: select:mcp__ccd_session_mgmt__set_session_title,mcp__ccd_sidebar__move_sessions,mcp__ccd_session_mgmt__get_session,mcp__ccd_session_mgmt__set_session_permission_mode,mcp__ccd_session_mgmt__send_message — then make these calls together in one parallel batch: (1) set_session_title session_id "self" to “\(newTitle)”; \(placeStep) (3) move_sessions session_ids ["\(s.appId)"] to \(archiveStep). Do not archive anything, the group is the archive. Then call get_session with session_id "self" and compare it with the old chat's settings — model “\(s.model)”\(s.effort.isEmpty ? "" : ", effort “\(s.effort)”")\(s.mode.isEmpty ? "" : ", permission mode “\(s.mode)”") — and fix every difference; never assume they match. Fix permission mode yourself with set_session_permission_mode (session_id "self"). Then always send_message to the old chat (session_id \(s.appId)) saying it has been replaced by your session id, and asking it to: stop every background task, Monitor, loop, scheduled wakeup or cron it started (TaskStop / ScheduleWakeup stop / CronDelete), ignore any later events or task notifications because the new chat owns the work now, and — only if your model or effort differs from the old values, since a chat can't change its own — load set_session_model and set_session_effort in one ToolSearch and call them on your session id with the old values; no other work, one-line reply. Restart any watchers the handoff lists in this chat yourself. Then continue from the handoff below — no recap needed.
+        Do these first, quietly, with no commentary. Load every tool you need in ONE ToolSearch call: select:mcp__ccd_session_mgmt__set_session_title,mcp__ccd_sidebar__move_sessions,mcp__ccd_session_mgmt__get_session,mcp__ccd_session_mgmt__set_session_permission_mode,mcp__ccd_session_mgmt__send_message — then make these calls together in one parallel batch: (1) set_session_title session_id "self" to “\(newTitle)”; \(placeStep) (3) move_sessions session_ids ["\(s.appId)"] to \(archiveStep). Do not archive anything, the group is the archive. Then call get_session with session_id "self" and compare it with the old chat's settings — model “\(s.model)”\(s.effort.isEmpty ? "" : ", effort “\(s.effort)”")\(s.mode.isEmpty ? "" : ", permission mode “\(s.mode)”") — and fix every difference; never assume they match. Fix permission mode yourself with set_session_permission_mode (session_id "self").\(suggestStep) Then always send_message to the old chat (session_id \(s.appId)) saying it has been replaced by your session id, and asking it to: stop every background task, Monitor, loop, scheduled wakeup or cron it started (TaskStop / ScheduleWakeup stop / CronDelete), ignore any later events or task notifications because the new chat owns the work now, and — only if your model or effort differs from the old values, since a chat can't change its own — load set_session_model and set_session_effort in one ToolSearch and call them on your session id with the old values; no other work, one-line reply. Restart any watchers the handoff lists in this chat yourself. Then continue from the handoff below — no recap needed.
 
         --- HANDOFF ---
         \(body)
@@ -1313,6 +1344,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !trusted, let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(u) } }
         if ProcessInfo.processInfo.environment["CM_AXPROBE"] != nil { DispatchQueue.global().asyncAfter(deadline: .now() + 1) { _ = MeterView.pressTrustWorkspace(folderName: "MotionMachine", probe: true) } }
         if let st = ProcessInfo.processInfo.environment["CM_STATE"] { view.mode = st == "asking" ? .asking : st == "done" ? .done : st == "working" ? .working : .expanded; view.message = "Writing handoff…"; view.frozen = true }
+        if let sg = ProcessInfo.processInfo.environment["CM_SUGGEST"] { view.doneSuggest = sg }   // test: show the suggestion line on the done card
         if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = ProcessInfo.processInfo.environment["CM_PROFILE"] == "help" ? .help : ProcessInfo.processInfo.environment["CM_PROFILE"] == "settings" ? .settings : .expanded; view.frozen = true }
         if let h = ProcessInfo.processInfo.environment["CM_HOVER"], let n = Int(h) { view.mode = .expanded; view.pinned = n; view.frozen = true }
         if ProcessInfo.processInfo.environment["CM_HELPDEMO"] != nil { view.frozen = true; view.mode = .expanded; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mode = v.mode == .help ? .expanded : .help; v.relayout() } }
@@ -1321,6 +1353,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let p = self?.panel, let v = self?.view, let e = (p.screen ?? NSScreen.main)?.frame else { return }
             p.setFrameOrigin(NSPoint(x: e.maxX - p.frame.width - 10, y: p.frame.minY)); v.snapDock(); log("snaptest: dock=\(v.dock) frame=\(p.frame)")
             p.setFrameOrigin(NSPoint(x: e.midX, y: p.frame.minY)); v.snapDock(); log("snaptest away: dock=\(v.dock) frame=\(p.frame)") } }
+        if let t = ProcessInfo.processInfo.environment["CM_TESTREPLACE"] { DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in   // test: Replace the chat with this exact title
+            if let v = self?.view, let c = v.sessions.first(where: { $0.title == t }) { log("testreplace: \(c.title)"); v.startHandoff(c) } else { log("testreplace: no chat titled \(t)") } } }
         if ProcessInfo.processInfo.environment["CM_MINIDEMO"] != nil { view.frozen = true; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mini.toggle(); v.relayout() } }
         if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: ProcessInfo.processInfo.environment["CM_TESTCWD"] ?? (ProcessInfo.processInfo.environment["CM_TESTSEND"] == "scratch" ? sessionsRoot.replacingOccurrences(of: "claude-code-sessions", with: "scratch-workspaces/test") : home + "/Documents/Claude")); log("testsend \(r)") } }
         let frameTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.view.stepAnim(); if self?.view.mode == .working { self?.view.needsDisplay = true } }
