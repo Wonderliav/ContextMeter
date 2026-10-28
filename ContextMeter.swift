@@ -48,6 +48,7 @@ func installUpdate() {
 }
 
 struct Config { var ask = 40.0, red = 60.0, group = "Archive", snooze = 20.0, window: Double? = nil, pinFiles: [String] = []
+    var auto = false, autoAt = 75.0, autoIdle = 120.0   // Replace idle chats by itself once they reach autoAt %; idle = this many seconds quiet
     static func load() -> Config {
         var c = Config()
         if let d = FileManager.default.contents(atPath: appDir + "/config.json"),
@@ -55,8 +56,17 @@ struct Config { var ask = 40.0, red = 60.0, group = "Archive", snooze = 20.0, wi
             c.ask = (j["askAtPercent"] as? Double) ?? c.ask; c.red = (j["redAtPercent"] as? Double) ?? c.red
             c.group = (j["archiveGroup"] as? String) ?? c.group; c.snooze = (j["snoozeMinutes"] as? Double) ?? c.snooze
             c.window = j["windowOverride"] as? Double; c.pinFiles = (j["pinFiles"] as? [String]) ?? []
+            c.auto = (j["autoReplace"] as? Bool) ?? c.auto; c.autoAt = (j["autoReplaceAtPercent"] as? Double) ?? c.autoAt
+            c.autoIdle = (j["autoReplaceIdleSeconds"] as? Double) ?? c.autoIdle
         }
         return c
+    }
+    /// Writes changed keys into config.json and leaves every other key as it was.
+    static func save(_ edits: [String: Any]) {
+        let path = appDir + "/config.json"
+        var j = (FileManager.default.contents(atPath: path).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }) ?? [:]
+        for (k, v) in edits { j[k] = v }
+        if let d = try? JSONSerialization.data(withJSONObject: j, options: [.prettyPrinted, .sortedKeys]) { try? d.write(to: URL(fileURLWithPath: path)) }
     }
 }
 
@@ -414,7 +424,7 @@ enum Look {
     static func font(_ s: CGFloat, _ w: NSFont.Weight = .regular) -> NSFont { NSFont(name: "ABCFavoritSS-Book", size: s) ?? .systemFont(ofSize: s, weight: w) }
 }
 
-enum Mode { case idle, expanded, help, asking, working, done }
+enum Mode { case idle, expanded, help, settings, asking, working, done }
 
 final class MeterView: NSView {
     var cfg = Config.load(), sessions: [Sess] = [], mode = Mode.idle, message = "", handoffText = ""
@@ -436,6 +446,8 @@ final class MeterView: NSView {
     let baseListWidth: CGFloat = 304, revealWidth: CGFloat = 92, paceH: CGFloat = 20
     func ease(_ t: CGFloat) -> CGFloat { bezier(0.65, 0, 0.35, 1, t) }   // smooth ease in-out
     var sweepStart = Date()
+    var autoT: CGFloat = Config.load().auto ? 1 : 0, autoTried: [String: Date] = [:], lastAutoAt = Date.distantPast, autoRunTitle: String?
+    func isPanel(_ m: Mode) -> Bool { m == .expanded || m == .help || m == .settings }
     // Edge dock: drag the pill to a screen edge and it tucks in as a thin line; hover opens it, a coloured line means look at it.
     var dock = UserDefaults.standard.integer(forKey: "dock")   // -1 left edge, 1 right edge, 0 free
     var docked: Bool { dock != 0 }
@@ -540,7 +552,7 @@ final class MeterView: NSView {
         if now.timeIntervalSince(swapStart) < swapDur + 10 * swapStagger + 0.05 { needsDisplay = true }
         if let w = window {
             var mp = convert(w.mouseLocationOutsideOfEventStream, from: nil); mp.x -= lastOX
-            let over: CGFloat = (mode == .expanded || mode == .help) && helpRect.insetBy(dx: -6, dy: -6).contains(mp) ? 1 : 0
+            let over: CGFloat = isPanel(mode) && helpRect.insetBy(dx: -6, dy: -6).contains(mp) ? 1 : 0
             if helpHover != over { helpHover = over > helpHover ? min(over, helpHover + dt / 0.12) : max(over, helpHover - dt / 0.18); needsDisplay = true }
         }
         if (dragging || settling), let w = window {              // glide the window to where the magnet wants it
@@ -583,13 +595,15 @@ final class MeterView: NSView {
             if want != peek { peek = want; relayout() }
             if !peek && chatAlert > 0 { needsDisplay = true }       // the line breathes while a chat needs Replace
         }
-        if (mode == .expanded || mode == .help) && pinned < 0 && !profiling && !frozen {
+        if isPanel(mode) && pinned < 0 && !profiling && !frozen {
             if inside { lastInside = now } else if now.timeIntervalSince(lastInside) > 1.0 { mode = .idle; relayout() }
         }
         if mode == .done {
             if doneSince == nil { doneSince = now }
             if inside { doneSince = now } else if now.timeIntervalSince(doneSince!) > 6 { mode = .idle; doneSince = nil; relayout() }
         } else { doneSince = nil }
+        let at: CGFloat = cfg.auto ? 1 : 0
+        if autoT != at { autoT += (at - autoT) * min(1, dt / 0.14); if abs(autoT - at) < 0.01 { autoT = at }; needsDisplay = true }
         if mode != .expanded { if rowT.contains(where: { $0 != 0 }) { rowT = [CGFloat](repeating: 0, count: 8); needsDisplay = true }; return }
         var under = -1
         if pinned >= 0 { under = pinned }
@@ -639,6 +653,20 @@ final class MeterView: NSView {
 
     func color(_ pct: Double) -> NSColor { pct >= cfg.red ? Look.red : pct >= cfg.ask ? Look.amber : Look.blue }
 
+    /// Auto-replace: a chat past the limit that nobody is using (not mid-turn, quiet for a couple of minutes, used in the last day) is replaced
+    /// without asking. One at a time, and a chat that failed is not retried for half an hour.
+    func autoReplaceIfDue() {
+        guard cfg.auto, !frozen, mode == .idle || mode == .expanded || mode == .help || mode == .settings, Date().timeIntervalSince(lastAutoAt) > 90 else { return }
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        guard let c = sessions.first(where: { $0.pct >= cfg.autoAt && !$0.busy && nowMs - $0.last > cfg.autoIdle * 1000 && nowMs - $0.last < 24 * 3600 * 1000
+                                              && Date().timeIntervalSince(autoTried[$0.appId] ?? .distantPast) > 1800 }) else { return }
+        guard AXIsProcessTrusted() else { log("auto-replace: Accessibility not trusted, skipping"); autoTried[c.appId] = Date(); return }
+        if ProcessInfo.processInfo.environment["CM_AUTODRY"] != nil { log("auto-replace DRY RUN: would replace “\(c.title)” at \(Int(c.pct))%"); autoTried[c.appId] = Date(); lastAutoAt = Date().addingTimeInterval(-60); return }
+        autoTried[c.appId] = Date(); lastAutoAt = Date(); autoRunTitle = c.title
+        log("auto-replace: “\(c.title)” at \(Int(c.pct))% (limit \(Int(cfg.autoAt))%)")
+        startHandoff(c)
+    }
+
     func tick() {
         cfg = Config.load()
         if !acctBusy, Date().timeIntervalSince(acctFetched) > (acct == nil ? 60 : 120) {
@@ -662,6 +690,7 @@ final class MeterView: NSView {
                     self.mode = .asking; self.asked.insert(p.appId); NSSound(named: "Tink")?.play()
                 }
                 if let p = s.first, p.pct < self.cfg.ask * 0.6 { self.asked.remove(p.appId) }
+                self.autoReplaceIfDue()
                 self.relayout()
             }
         }
@@ -688,6 +717,22 @@ final class MeterView: NSView {
         let q = NSAttributedString(string: active ? "✕" : "?", attributes: [.font: NSFont.systemFont(ofSize: active ? 8 : 10, weight: .bold), .foregroundColor: NSColor(white: 1, alpha: active ? 1 : 0.7 + 0.3 * h)])
         q.draw(at: NSPoint(x: r.midX - q.size().width / 2, y: r.midY - q.size().height / 2))
         hits.append((base.insetBy(dx: -10, dy: -8), { [weak self] in self?.mode = active ? .expanded : .help; self?.relayout() }))
+    }
+    /// Small gear left of the "?": opens the settings.
+    func gearButton() {
+        let r = NSRect(x: cw - 14 - 16 - 10 - 16, y: bounds.height - drawH + 5, width: 16, height: 16)
+        if let img = NSImage(systemSymbolName: "gearshape.fill", accessibilityDescription: "Settings")?.withSymbolConfiguration(.init(pointSize: 11, weight: .regular)) {
+            let t = img.copy() as! NSImage; t.lockFocus(); (cfg.auto ? Look.blue : NSColor(white: 1, alpha: 0.6)).set()
+            NSRect(origin: .zero, size: t.size).fill(using: .sourceAtop); t.unlockFocus()
+            t.draw(in: NSRect(x: r.midX - t.size.width / 2, y: r.midY - t.size.height / 2, width: t.size.width, height: t.size.height))
+        }
+        hits.append((r.insetBy(dx: -8, dy: -8), { [weak self] in self?.mode = .settings; self?.relayout() }))
+    }
+    func circleButton(_ glyph: String, _ r: NSRect, enabled: Bool, _ act: @escaping () -> Void) {
+        NSColor(white: 1, alpha: enabled ? 0.16 : 0.07).setFill(); NSBezierPath(ovalIn: r).fill()
+        let g = NSAttributedString(string: glyph, attributes: [.font: NSFont.systemFont(ofSize: 14, weight: .medium), .foregroundColor: NSColor(white: 1, alpha: enabled ? 0.95 : 0.3)])
+        g.draw(at: NSPoint(x: r.midX - g.size().width / 2, y: r.midY - g.size().height / 2))
+        if enabled { hits.append((r.insetBy(dx: -4, dy: -4), act)) }
     }
     func money(_ x: Double) -> String { x >= 1000 ? String(format: "$%.1fk", x / 1000) : x >= 10 ? String(format: "$%.0f", x) : String(format: "$%.2f", x) }
     /// "On pace for $3.1k this month · saved $42 this week" — red when this month's pace runs past the limit.
@@ -721,6 +766,7 @@ final class MeterView: NSView {
             h = 40 + paceH + CGFloat(min(sessions.count, 8)) * 26 + 8 + 18   // + pace line + credit line
             w = max(headerWidth + 16, baseListWidth)
         case .help: h = 40 + 30 + CGFloat(helpRows.count) * 24 + 8 + 18; w = max(headerWidth + 16, baseListWidth)
+        case .settings: h = 40 + 30 + 68 + 44 + 26; w = max(headerWidth + 16, baseListWidth)
         case .asking: h = 40 + 124; w = 312
         case .working: h = 40 + 62; w = 312
         case .done: h = 40 + 124; w = 312
@@ -728,7 +774,7 @@ final class MeterView: NSView {
         logicalWidth = w
         let target = CGSize(width: w, height: h)
         if mode == .expanded && prevMode != .expanded { lastInside = Date() }
-        let swap = (mode == .help && prevMode == .expanded) || (mode == .expanded && prevMode == .help)
+        let swap = mode != prevMode && isPanel(mode) && isPanel(prevMode)
         if swap { swapStart = Date(); lastInside = Date() }
         prevMode = mode
         if lastTarget == .zero {                                  // first layout: no animation
@@ -899,7 +945,7 @@ final class MeterView: NSView {
             } }
             let credit = NSAttributedString(string: "Developed by Liav.T", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor(white: 1, alpha: 0.3)])
             credit.draw(at: NSPoint(x: (cw - credit.size().width) / 2, y: bounds.height - drawH + 8))
-            helpButton(active: false)
+            helpButton(active: false); gearButton()
             if updateAvailable {
                 let up = NSAttributedString(string: "Update", attributes: [.font: NSFont.systemFont(ofSize: 9, weight: .semibold), .foregroundColor: Look.blue])
                 let r = NSRect(x: 16, y: bounds.height - drawH + 8, width: up.size().width, height: up.size().height)
@@ -931,6 +977,34 @@ final class MeterView: NSView {
                 }
                 text(row.1, NSPoint(x: 48, y: y + 5), 11.5, NSColor(white: 0.82, alpha: 1), width: cw - 62)
             } }
+            let credit = NSAttributedString(string: "Developed by Liav.T", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor(white: 1, alpha: 0.3)])
+            credit.draw(at: NSPoint(x: (cw - credit.size().width) / 2, y: bounds.height - drawH + 8))
+            helpButton(active: true); gearButton()
+        case .settings:
+            entering(0) { text("Settings", NSPoint(x: 16, y: top - 24), 12, .white, .semibold) }
+            entering(1) {
+                let y = top - 30 - 34
+                text("Replace chats by itself", NSPoint(x: 16, y: y + 8), 12.5, .white)
+                let r = NSRect(x: cw - 16 - 38, y: y + 7, width: 38, height: 22), e = ease(autoT)
+                (NSColor(white: 1, alpha: 0.16).blended(withFraction: e, of: Look.blue) ?? Look.blue).setFill()
+                NSBezierPath(roundedRect: r, xRadius: 11, yRadius: 11).fill()
+                NSColor.white.setFill(); NSBezierPath(ovalIn: NSRect(x: r.minX + 3 + 16 * e, y: r.minY + 3, width: 16, height: 16)).fill()
+                hits.append((r.insetBy(dx: -8, dy: -6), { [weak self] in guard let s = self else { return }; s.cfg.auto.toggle(); Config.save(["autoReplace": s.cfg.auto]) }))
+            }
+            entering(2) {
+                let y = top - 30 - 68, on = cfg.auto
+                text("When a chat is this full", NSPoint(x: 16, y: y + 8), 12.5, NSColor(white: 1, alpha: on ? 1 : 0.45))
+                let plus = NSRect(x: cw - 16 - 22, y: y + 7, width: 22, height: 22), minus = NSRect(x: plus.minX - 48 - 22, y: y + 7, width: 22, height: 22)
+                let v = NSAttributedString(string: "\(Int(cfg.autoAt))%", attributes: [.font: Look.font(13, .semibold), .foregroundColor: NSColor(white: 1, alpha: on ? 1 : 0.45)])
+                v.draw(at: NSPoint(x: minus.maxX + (48 - v.size().width) / 2, y: y + 18 - v.size().height / 2))
+                func step(_ d: Double) { let n = min(95, max(40, cfg.autoAt + d)); cfg.autoAt = n; Config.save(["autoReplaceAtPercent": n]) }
+                circleButton("−", minus, enabled: on && cfg.autoAt > 40) { step(-5) }
+                circleButton("+", plus, enabled: on && cfg.autoAt < 95) { step(5) }
+            }
+            entering(3) {
+                let cap = NSAttributedString(string: "Only chats nobody is using: not mid-answer, quiet for 2 minutes, used in the last day. The new chat opens with a handoff.", attributes: [.font: Look.font(11), .foregroundColor: NSColor(white: 1, alpha: 0.45)])
+                cap.draw(in: NSRect(x: 16, y: top - 30 - 68 - 50, width: cw - 32, height: 40))
+            }
             let credit = NSAttributedString(string: "Developed by Liav.T", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor(white: 1, alpha: 0.3)])
             credit.draw(at: NSPoint(x: (cw - credit.size().width) / 2, y: bounds.height - drawH + 8))
             helpButton(active: true)
@@ -978,6 +1052,32 @@ final class MeterView: NSView {
 
     enum SendResult { case sent, prefilled, failed }
 
+    /// Finds the Claude app's "Trust workspace" button for the folder we just opened and presses it. The dialog is the app's own question
+    /// about the folder of the chat being replaced, so it is only answered while our own handoff link is being sent, only for a button with
+    /// exactly that name, and only if the window also names that folder.
+    static func pressTrustWorkspace(folderName: String, probe: Bool = false) -> Bool {
+        guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").first else { return false }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetAttributeValue(root, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        var nodes = 0, button: AXUIElement?, sawFolder = false
+        func attr(_ el: AXUIElement, _ a: String) -> CFTypeRef? { var v: CFTypeRef?; AXUIElementCopyAttributeValue(el, a as CFString, &v); return v }
+        func texts(_ el: AXUIElement) -> [String] { [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].compactMap { attr(el, $0) as? String } }
+        func walk(_ el: AXUIElement, _ depth: Int) {
+            guard depth < 30, nodes < 8000, button == nil else { return }
+            nodes += 1
+            let role = (attr(el, kAXRoleAttribute) as? String) ?? "", t = texts(el)
+            let kids = (attr(el, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+            if t.contains(where: { $0.contains(folderName) }) { sawFolder = true }
+            if probe, t.contains(where: { $0.contains("Trust") || $0.contains("Cancel") }) { log("axprobe depth=\(depth) role=\(role) texts=\(t) kids=\(kids.count)") }
+            if role == "AXButton", t.contains("Trust workspace") || kids.contains(where: { texts($0).contains("Trust workspace") }) { button = el; return }
+            for k in kids { walk(k, depth + 1) }
+        }
+        walk(root, 0)
+        if probe { log("axprobe nodes=\(nodes) sawFolder=\(sawFolder) button=\(button != nil)") }
+        guard let b = button, sawFolder else { return false }
+        return AXUIElementPerformAction(b, kAXPressAction as CFString) == .success
+    }
+
     /// Opens a new chat in the Claude app via its claude://code/new link (right folder, handoff pre-filled),
     /// then presses Return. Pressing a key needs Accessibility; without it the chat is left ready to send.
     /// The Claude app's focused element: (role, start of its text). Needs Accessibility.
@@ -1005,9 +1105,15 @@ final class MeterView: NSView {
         guard AXIsProcessTrusted() else { log("link opened; Accessibility not trusted, left for manual Return"); return .prefilled }
         // Press Return only when Claude's message box has focus and holds the handoff, never on a dialog or another app.
         let start = Date(), marker = String(text.prefix(24))
-        var presses = 0
+        var presses = 0, trusts = 0, lastTrustLook = Date.distantPast
+        let folderName = URL(fileURLWithPath: cwd).lastPathComponent
         while Date().timeIntervalSince(start) < 20 && presses < 3 {
             usleep(400_000)
+            // The app asks "Trust this workspace?" for the folder of the chat being replaced; answer it so the handoff goes out untouched.
+            if trusts < 2, Date().timeIntervalSince(lastTrustLook) > 0.9 {
+                lastTrustLook = Date()
+                if pressTrustWorkspace(folderName: folderName) { trusts += 1; log("trust: pressed Trust workspace for \(folderName)"); usleep(1_000_000); continue }
+            }
             let ff = claudeFocus()
             let filled = ff?.role == "AXTextArea" && (ff?.value ?? "").hasPrefix(marker)
             if presses > 0 && !filled { log("return: sent after \(presses) press(es)"); return .sent }   // box emptied or chat moved on = message went out
@@ -1136,6 +1242,7 @@ final class MeterView: NSView {
             DispatchQueue.main.async {
                 self.doneTitle = filed ? "All filed ✓" : "New chat is open ✓"
                 self.doneSub = filed ? "“\(newTitle)” is in \(groupName). The old chat is in \(self.cfg.group)." : "It hasn't finished filing yet. Give it a moment."
+                if self.autoRunTitle != nil { self.doneTitle = "Replaced by itself ✓"; self.doneSub = "“\(s.title)” hit \(Int(self.cfg.autoAt))%. “\(newTitle)” took over."; self.autoRunTitle = nil }
                 NSSound(named: "Glass")?.play(); self.mode = .done; self.relayout()
             }
         }
@@ -1204,8 +1311,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         log("accessibility trusted = \(trusted)")
         if askNow { UserDefaults.standard.set(true, forKey: askedKey)
             if !trusted, let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(u) } }
+        if ProcessInfo.processInfo.environment["CM_AXPROBE"] != nil { DispatchQueue.global().asyncAfter(deadline: .now() + 1) { _ = MeterView.pressTrustWorkspace(folderName: "MotionMachine", probe: true) } }
         if let st = ProcessInfo.processInfo.environment["CM_STATE"] { view.mode = st == "asking" ? .asking : st == "done" ? .done : st == "working" ? .working : .expanded; view.message = "Writing handoff…"; view.frozen = true }
-        if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = ProcessInfo.processInfo.environment["CM_PROFILE"] == "help" ? .help : .expanded; view.frozen = true }
+        if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = ProcessInfo.processInfo.environment["CM_PROFILE"] == "help" ? .help : ProcessInfo.processInfo.environment["CM_PROFILE"] == "settings" ? .settings : .expanded; view.frozen = true }
         if let h = ProcessInfo.processInfo.environment["CM_HOVER"], let n = Int(h) { view.mode = .expanded; view.pinned = n; view.frozen = true }
         if ProcessInfo.processInfo.environment["CM_HELPDEMO"] != nil { view.frozen = true; view.mode = .expanded; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mode = v.mode == .help ? .expanded : .help; v.relayout() } }
         if ProcessInfo.processInfo.environment["CM_DOCKDEMO"] != nil { view.frozen = true; Timer.scheduledTimer(withTimeInterval: 1.8, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.peek.toggle(); v.relayout() } }
@@ -1214,7 +1322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             p.setFrameOrigin(NSPoint(x: e.maxX - p.frame.width - 10, y: p.frame.minY)); v.snapDock(); log("snaptest: dock=\(v.dock) frame=\(p.frame)")
             p.setFrameOrigin(NSPoint(x: e.midX, y: p.frame.minY)); v.snapDock(); log("snaptest away: dock=\(v.dock) frame=\(p.frame)") } }
         if ProcessInfo.processInfo.environment["CM_MINIDEMO"] != nil { view.frozen = true; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mini.toggle(); v.relayout() } }
-        if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: ProcessInfo.processInfo.environment["CM_TESTSEND"] == "scratch" ? sessionsRoot.replacingOccurrences(of: "claude-code-sessions", with: "scratch-workspaces/test") : home + "/Documents/Claude"); log("testsend \(r)") } }
+        if ProcessInfo.processInfo.environment["CM_TESTSEND"] != nil { DispatchQueue.global().async { let r = MeterView.sendToNewChat(text: "Reply with just OK", cwd: ProcessInfo.processInfo.environment["CM_TESTCWD"] ?? (ProcessInfo.processInfo.environment["CM_TESTSEND"] == "scratch" ? sessionsRoot.replacingOccurrences(of: "claude-code-sessions", with: "scratch-workspaces/test") : home + "/Documents/Claude")); log("testsend \(r)") } }
         let frameTimer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.view.stepAnim(); if self?.view.mode == .working { self?.view.needsDisplay = true } }
         RunLoop.main.add(frameTimer, forMode: .common)
         view.tick(); Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.view.tick() }
