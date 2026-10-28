@@ -7,3 +7,4 @@ usage-cache.json
 stats.json
 replaces.json
 usage-history.json
+*.app/
