@@ -1013,11 +1013,59 @@ static func sendToNewChat(text: String, cwd: String) -> SendResult {
     func copyHandoff() { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(handoffText, forType: .string) }
 
 static func codexCLI() -> String? {
+        let fm = FileManager.default
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/zsh"); p.arguments = ["-lc", "command -v codex"]
         let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
-        if (try? p.run()) != nil { p.waitUntilExit(); let s = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines); if !s.isEmpty, FileManager.default.isExecutableFile(atPath: s) { return s } }
-        for c in ["/Applications/Codex.app/Contents/Resources/codex", "/opt/homebrew/bin/codex", "/usr/local/bin/codex", home + "/.codex/bin/codex"] where FileManager.default.isExecutableFile(atPath: c) { return c }
+        if (try? p.run()) != nil { p.waitUntilExit(); let s = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines); if !s.isEmpty, fm.isExecutableFile(atPath: s) { return s } }
+        for c in ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", home + "/.codex/bin/codex", home + "/.local/bin/codex", "/Applications/Codex.app/Contents/Resources/codex", "/Applications/Codex.app/Contents/MacOS/codex"] where fm.isExecutableFile(atPath: c) { return c }
+        // Any Codex app bundle: look inside it for an executable called "codex".
+        for root in ["/Applications", home + "/Applications"] {
+            for a in (try? fm.contentsOfDirectory(atPath: root)) ?? [] where a.contains("Codex") && a.hasSuffix(".app") {
+                guard let en = fm.enumerator(atPath: root + "/" + a) else { continue }
+                var seen = 0
+                for case let rel as String in en { seen += 1; if seen > 30_000 { break }
+                    if rel.hasSuffix("/codex") || rel.hasSuffix("/codex-cli"), fm.isExecutableFile(atPath: root + "/" + a + "/" + rel) { return root + "/" + a + "/" + rel } }
+            }
+        }
         return nil
+    }
+    /// Runs the Codex CLI with these arguments in the chat's folder. Returns what it printed and its exit code; gives up after the time limit.
+    static func runCodex(_ cli: String, _ args: [String], cwd: String, limit: TimeInterval, tick: @escaping (Int) -> Void) -> (out: String, err: String, status: Int32) {
+        let outFile = NSTemporaryDirectory() + "cm-codex-out.txt", errFile = NSTemporaryDirectory() + "cm-codex-err.txt"
+        FileManager.default.createFile(atPath: outFile, contents: nil); FileManager.default.createFile(atPath: errFile, contents: nil)
+        let p = Process(); p.executableURL = URL(fileURLWithPath: cli); p.arguments = args
+        if FileManager.default.fileExists(atPath: cwd) { p.currentDirectoryURL = URL(fileURLWithPath: cwd) }
+        var env = ProcessInfo.processInfo.environment; env["PATH"] = (env["PATH"] ?? "") + ":/opt/homebrew/bin:/usr/local/bin:" + home + "/.local/bin"; p.environment = env
+        p.standardOutput = FileHandle(forWritingAtPath: outFile); p.standardError = FileHandle(forWritingAtPath: errFile); p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return ("", "cannot run \(cli): \(error)", -1) }
+        let t0 = Date()
+        while p.isRunning && Date().timeIntervalSince(t0) < limit { Thread.sleep(forTimeInterval: 1); tick(Int(Date().timeIntervalSince(t0))) }
+        if p.isRunning { p.terminate(); log("handoff: \(args.prefix(2).joined(separator: " ")) took over \(Int(limit))s, stopped it") }
+        p.waitUntilExit()
+        return (((try? String(contentsOfFile: outFile, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                ((try? String(contentsOfFile: errFile, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines), p.terminationStatus)
+    }
+    /// A summary written without any model: the first request and the last turns of the chat log, so a new chat can always continue.
+    static func localHandoff(_ path: String, title: String, cwd: String) -> String {
+        guard let h = FileHandle(forReadingAtPath: path) else { return "" }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        try? h.seek(toOffset: size > 6_000_000 ? size - 6_000_000 : 0)
+        let data = (try? h.readToEnd()) ?? Data()
+        var turns: [(String, String)] = []   // (who, text)
+        for line in data.split(separator: 10) {
+            guard line.range(of: Data("\"payload\":{\"type\":\"user_message\"".utf8)) != nil || line.range(of: Data("\"payload\":{\"type\":\"agent_message\"".utf8)) != nil,
+                  let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any], let p = o["payload"] as? [String: Any],
+                  let t = p["type"] as? String, let m = p["message"] as? String, !m.isEmpty else { continue }
+            turns.append((t == "user_message" ? "You" : "Codex", m))
+        }
+        guard !turns.isEmpty else { return "" }
+        func clip(_ s: String, _ n: Int) -> String { s.count > n ? String(s.prefix(n)) + " …" : s }
+        let first = turns.first(where: { $0.0 == "You" })?.1 ?? ""
+        var md = "## Goal and first request\n\(clip(first, 1800))\n\n## Folder\n\(cwd)\n\n## Last turns of the chat (written from the log, not summarised)\n"
+        for t in turns.suffix(10) { md += "\n**\(t.0):** \(clip(t.1, 900))\n" }
+        md += "\n## Note\nThis handoff was cut straight from the chat log of “\(title)”. For anything older than the turns above, read the log file named at the top."
+        return md
     }
 
 func startHandoff(_ s: Sess) {
@@ -1032,27 +1080,21 @@ func startHandoff(_ s: Sess) {
         DispatchQueue.global().async {
             var body = ""
             if let cli = MeterView.codexCLI() {
-                let outFile = NSTemporaryDirectory() + "cm-codex-handoff.txt", errFile = NSTemporaryDirectory() + "cm-codex-handoff-err.txt"
-                try? FileManager.default.removeItem(atPath: outFile)
-                FileManager.default.createFile(atPath: errFile, contents: nil)
-                let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                p.arguments = ["-lc", "cd \"$CM_CWD\" && \"$CM_CLI\" exec resume \"$CM_ID\" \"$CM_PROMPT\" --skip-git-repo-check -o \"$CM_OUT\" >/dev/null"]
-                var env: [String: String] = ProcessInfo.processInfo.environment
-                env["CM_CWD"] = s.cwd; env["CM_PROMPT"] = prompt; env["CM_ID"] = s.cliId; env["CM_CLI"] = cli; env["CM_OUT"] = outFile
-                p.environment = env; p.standardError = FileHandle(forWritingAtPath: errFile); p.standardInput = FileHandle.nullDevice
-                do { try p.run() } catch { log("handoff: cannot run \(cli): \(error)") }
-                let t0 = Date(), limit: TimeInterval = 240          // a stuck summary never blocks Replace for long
-                while p.isRunning && Date().timeIntervalSince(t0) < limit {
-                    Thread.sleep(forTimeInterval: 1)
-                    let sec = Int(Date().timeIntervalSince(t0))
-                    DispatchQueue.main.async { self.message = "Writing handoff… \(sec)s" }
+                log("handoff: using \(cli)")
+                // The final answer is what `codex exec` prints on stdout. The flag position differs between versions, so try the forms in turn.
+                let forms: [[String]] = [["exec", "resume", s.cliId, prompt, "--skip-git-repo-check"], ["exec", "--skip-git-repo-check", "resume", s.cliId, prompt], ["exec", "resume", s.cliId, prompt]]
+                let t0 = Date()
+                for (n, a) in forms.enumerated() where body.isEmpty && Date().timeIntervalSince(t0) < 240 {
+                    let r = MeterView.runCodex(cli, a, cwd: s.cwd, limit: max(30, 240 - Date().timeIntervalSince(t0))) { sec in DispatchQueue.main.async { self.message = "Writing handoff… \(Int(Date().timeIntervalSince(t0)))s" } }
+                    body = r.out
+                    if body.isEmpty { log("handoff: form \(n + 1) exit \(r.status): \(r.err.prefix(500).replacingOccurrences(of: "\n", with: " | "))") }
                 }
-                if p.isRunning { p.terminate(); log("handoff: summary took over \(Int(limit))s, stopped it") }
-                p.waitUntilExit()
-                body = ((try? String(contentsOfFile: outFile, encoding: .utf8)) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if body.isEmpty { log("handoff: \(cli) exit \(p.terminationStatus): \(((try? String(contentsOfFile: errFile, encoding: .utf8)) ?? "").prefix(400).replacingOccurrences(of: "\n", with: " | "))") }
-            } else { log("handoff: no Codex CLI found (PATH or the Codex app)") }
-            // Never strand the user: if the summary couldn't be written, the new chat reads the old log itself.
+            } else { log("handoff: no Codex CLI found (PATH, ~/.codex/bin, /Applications/*Codex*.app)") }
+            // No model summary: cut one from the chat log, so the new chat still gets real content.
+            if body.isEmpty, let path = rolloutPaths[s.appId] {
+                body = MeterView.localHandoff(path, title: s.title, cwd: s.cwd)
+                if !body.isEmpty { log("handoff: using the summary cut from the log") }
+            }
             if body.isEmpty {
                 body = "The automatic summary couldn't be written. Before anything else, read the previous chat's log yourself: \(rolloutPaths[s.appId] ?? "(not found)") (one JSON event per line; user_message and agent_message events are the conversation), write a short summary of where things stand, then continue from there."
                 log("handoff: using read-the-old-log fallback")
@@ -1184,6 +1226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if askNow { UserDefaults.standard.set(true, forKey: askedKey)
             if !trusted, let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") { NSWorkspace.shared.open(u) } }
         if let st = ProcessInfo.processInfo.environment["CM_STATE"] { view.mode = st == "asking" ? .asking : st == "done" ? .done : st == "working" ? .working : .expanded; view.message = "Writing handoff…"; view.frozen = true }
+        if let sg = ProcessInfo.processInfo.environment["CM_SUGGEST"] { view.doneSuggest = sg }   // test: show the suggestion line on the done card
         if ProcessInfo.processInfo.environment["CM_PROFILE"] != nil { view.mode = ProcessInfo.processInfo.environment["CM_PROFILE"] == "help" ? .help : ProcessInfo.processInfo.environment["CM_PROFILE"] == "settings" ? .settings : .expanded; view.frozen = true }
         if let h = ProcessInfo.processInfo.environment["CM_HOVER"], let n = Int(h) { view.mode = .expanded; view.pinned = n; view.frozen = true }
         if ProcessInfo.processInfo.environment["CM_HELPDEMO"] != nil { view.frozen = true; view.mode = .expanded; Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in guard let v = self?.view else { return }; v.mode = v.mode == .help ? .expanded : .help; v.relayout() } }
