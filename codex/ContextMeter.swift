@@ -49,6 +49,7 @@ func installUpdate() {
 
 struct Config { var ask = 40.0, red = 60.0, group = "Archive", snooze = 20.0, window: Double? = nil, pinFiles: [String] = []
     var monthlyLimit = 0.0   // optional $ limit for the ring when the plan has no % limit
+    var remind = true   // a docked pill pops out for a few seconds while something needs you
     var auto = false, autoAt = 75.0, autoIdle = 120.0   // Replace idle chats by itself once they reach autoAt %; idle = this many seconds quiet
     static func load() -> Config {
         var c = Config()
@@ -58,7 +59,7 @@ struct Config { var ask = 40.0, red = 60.0, group = "Archive", snooze = 20.0, wi
             c.group = (j["archiveGroup"] as? String) ?? c.group; c.snooze = (j["snoozeMinutes"] as? Double) ?? c.snooze
             c.window = j["windowOverride"] as? Double; c.pinFiles = (j["pinFiles"] as? [String]) ?? []
             c.auto = (j["autoReplace"] as? Bool) ?? c.auto; c.autoAt = (j["autoReplaceAtPercent"] as? Double) ?? c.autoAt
-            c.autoIdle = (j["autoReplaceIdleSeconds"] as? Double) ?? c.autoIdle; c.monthlyLimit = (j["monthlyLimitUsd"] as? Double) ?? c.monthlyLimit
+            c.autoIdle = (j["autoReplaceIdleSeconds"] as? Double) ?? c.autoIdle; c.remind = (j["remindWhenDocked"] as? Bool) ?? c.remind; c.monthlyLimit = (j["monthlyLimitUsd"] as? Double) ?? c.monthlyLimit
         }
         return c
     }
@@ -379,6 +380,7 @@ final class MeterView: NSView {
     let baseListWidth: CGFloat = 304, revealWidth: CGFloat = 92, paceH: CGFloat = 20
     func ease(_ t: CGFloat) -> CGFloat { bezier(0.65, 0, 0.35, 1, t) }   // smooth ease in-out
     var sweepStart = Date()
+    var remindT: CGFloat = Config.load().remind ? 1 : 0, lastRemind = Date(), lastAlertSig = ""
     var autoT: CGFloat = Config.load().auto ? 1 : 0, autoTried: [String: Date] = [:], lastAutoAt = Date.distantPast, autoRunTitle: String?
     func isPanel(_ m: Mode) -> Bool { m == .expanded || m == .help || m == .settings }
     // Edge dock: drag the pill to a screen edge and it tucks in as a thin line; hover opens it, a coloured line means look at it.
@@ -519,7 +521,7 @@ final class MeterView: NSView {
         if docked && !peek && mode == .idle { zone = zone.insetBy(dx: -18, dy: -12) }          // the line wakes up as the pointer nears it
         let near = zone.contains(NSEvent.mouseLocation)
         if let w = window {
-            let target: CGFloat = inside || mode != .idle ? 1 : docked ? (alertLevel > 0 ? 1 : 0.75) : 0.5
+            let target: CGFloat = inside || mode != .idle ? 1 : docked ? (alertLevel > 0 ? 1 : 0.75) : (chatAlert > 0 ? 0.9 : 0.5)
             if abs(w.alphaValue - target) > 0.005 { w.alphaValue += (target - w.alphaValue) * min(1, dt * 7) } else if w.alphaValue != target { w.alphaValue = target }
         }
         if docked && mode == .idle && !profiling && !frozen {                // the line opens while the pointer is on it, closes half a second after
@@ -527,6 +529,14 @@ final class MeterView: NSView {
             let want = near || now < peekUntil
             if want != peek { peek = want; relayout() }
             if !peek && chatAlert > 0 { needsDisplay = true }       // the line breathes while a chat needs Replace
+            // Reminder: a coloured line is easy to stop seeing, so the pill pops out for a few seconds now and then while something needs you.
+            // A chat past the red line every 2 min, an amber chat every 5 min, only the account over its limit every 15 min; a new alert shows at once.
+            if cfg.remind, !peek, !dragging, alertLevel > 0 {
+                let sig = "\(chatAlert)-\(fullCount)-\(alertLevel)"
+                let every: TimeInterval = Double(ProcessInfo.processInfo.environment["CM_REMIND_EVERY"] ?? "") ?? (chatAlert == 2 ? 120 : chatAlert == 1 ? 300 : 900)
+                if sig != lastAlertSig { lastAlertSig = sig; if chatAlert > 0, now.timeIntervalSince(lastRemind) > 20 { lastRemind = now; peekUntil = now.addingTimeInterval(3.6) } }
+                else if now.timeIntervalSince(lastRemind) > every { lastRemind = now; peekUntil = now.addingTimeInterval(3.6) }
+            }
         }
         if isPanel(mode) && pinned < 0 && !profiling && !frozen {
             if inside { lastInside = now } else if now.timeIntervalSince(lastInside) > 1.0 { mode = .idle; relayout() }
@@ -535,6 +545,8 @@ final class MeterView: NSView {
             if doneSince == nil { doneSince = now }
             if inside { doneSince = now } else if now.timeIntervalSince(doneSince!) > 6 { mode = .idle; doneSince = nil; relayout() }
         } else { doneSince = nil }
+        let rt: CGFloat = cfg.remind ? 1 : 0
+        if remindT != rt { remindT += (rt - remindT) * min(1, dt / 0.14); if abs(remindT - rt) < 0.01 { remindT = rt }; needsDisplay = true }
         let at: CGFloat = cfg.auto ? 1 : 0
         if autoT != at { autoT += (at - autoT) * min(1, dt / 0.14); if abs(autoT - at) < 0.01 { autoT = at }; needsDisplay = true }
         if mode != .expanded { if rowT.contains(where: { $0 != 0 }) { rowT = [CGFloat](repeating: 0, count: 8); needsDisplay = true }; return }
@@ -699,7 +711,7 @@ final class MeterView: NSView {
             h = 40 + paceH + CGFloat(min(sessions.count, 8)) * 26 + 8 + 18   // + pace line + credit line
             w = max(headerWidth + 16, baseListWidth)
         case .help: h = 40 + 30 + CGFloat(helpRows.count) * 24 + 8 + 18; w = max(headerWidth + 16, baseListWidth)
-        case .settings: h = 40 + 30 + 68 + 44 + 26; w = max(headerWidth + 16, baseListWidth)
+        case .settings: h = 40 + 30 + 102 + 58 + 26; w = max(headerWidth + 16, baseListWidth)
         case .asking: h = 40 + 124; w = 312
         case .working: h = 40 + 62; w = 312
         case .done: h = 40 + 124 + (doneSuggest == nil ? 0 : 24); w = 312
@@ -935,8 +947,17 @@ final class MeterView: NSView {
                 circleButton("+", plus, enabled: on && cfg.autoAt < 95) { step(5) }
             }
             entering(3) {
-                let cap = NSAttributedString(string: "Only chats nobody is using: not mid-answer, quiet for 2 minutes, used in the last day. The new chat opens with a handoff.", attributes: [.font: Look.font(11), .foregroundColor: NSColor(white: 1, alpha: 0.45)])
-                cap.draw(in: NSRect(x: 16, y: top - 30 - 68 - 50, width: cw - 32, height: 40))
+                let y = top - 30 - 102
+                text("Pop out when something needs me", NSPoint(x: 16, y: y + 8), 12.5, .white)
+                let r = NSRect(x: cw - 16 - 38, y: y + 7, width: 38, height: 22), e = ease(remindT)
+                (NSColor(white: 1, alpha: 0.16).blended(withFraction: e, of: Look.blue) ?? Look.blue).setFill()
+                NSBezierPath(roundedRect: r, xRadius: 11, yRadius: 11).fill()
+                NSColor.white.setFill(); NSBezierPath(ovalIn: NSRect(x: r.minX + 3 + 16 * e, y: r.minY + 3, width: 16, height: 16)).fill()
+                hits.append((r.insetBy(dx: -8, dy: -6), { [weak self] in guard let s = self else { return }; s.cfg.remind.toggle(); Config.save(["remindWhenDocked": s.cfg.remind]) }))
+            }
+            entering(4) {
+                let cap = NSAttributedString(string: "Auto-replace only touches chats nobody is using: not mid-answer, quiet for 2 minutes, used in the last day. Pop-out: the docked line opens for a few seconds every couple of minutes while a chat is amber or red.", attributes: [.font: Look.font(10.5), .foregroundColor: NSColor(white: 1, alpha: 0.45)])
+                cap.draw(in: NSRect(x: 16, y: top - 30 - 102 - 62, width: cw - 32, height: 56))
             }
             let credit = NSAttributedString(string: "Developed by Liav.T", attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor(white: 1, alpha: 0.3)])
             credit.draw(at: NSPoint(x: (cw - credit.size().width) / 2, y: bounds.height - drawH + 8))
